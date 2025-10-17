@@ -70,7 +70,7 @@ def load_df_v2(path_or_file=None, url=None) -> pd.DataFrame:
         else:
             raise ValueError("Unsupported path_or_file type.")
     elif url:
-        # pandas will fetch URL internally; we'll decode with fallback encodings below
+        # pandas will fetch URL internally; I'll decode with fallback encodings below
         for enc in ["Windows-1252", "utf-8", "latin1", "ISO-8859-1", "cp1256"]:
             try:
                 df_try = pd.read_csv(url, encoding=enc, sep=None, engine="python")
@@ -525,7 +525,7 @@ with tabs[4]:
         rmse = np.sqrt(mean_squared_error(y_test, y_pred))
 
     r1, r2, r3 = st.columns(3)
-    r1.metric("R²", f"{r2_score(y_test, y_pred):.3f}")  # <-- FIX BELOW
+    r1.metric("R²", f"{r2_score(y_test, y_pred):.3f}")  
     r2.metric("MAE", f"{mean_absolute_error(y_test, y_pred):.3f}")
     r3.metric("RMSE", f"{rmse:.3f}")
 
@@ -554,7 +554,7 @@ if show_all:
     st.markdown("---")
     st.header("🧾 Full Page View")
 
-    # 1) Correlation (if numeric columns exist)
+    # 1) Correlation 
     _num = df.select_dtypes(include=np.number)
     if not _num.empty:
         try:
@@ -575,7 +575,7 @@ if show_all:
     if "profit" in df.columns:
         st.plotly_chart(px.histogram(df, x="profit", title="Histogram: profit"), use_container_width=True)
 
-    # 4) Counts for first categorical column (if exists)
+    # 4) Counts for first categorical column 
     _cats = df.select_dtypes(exclude=[np.number, "bool", "boolean"]).columns.tolist()
     if _cats:
         _cx = _cats[0]

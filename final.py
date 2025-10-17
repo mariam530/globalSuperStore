@@ -1,4 +1,3 @@
-
 # app.py
 # ============================================================
 # Streamlit: Full Analysis + Profit Modeling (Classification & Regression)
@@ -159,35 +158,20 @@ def load_df_v2(path_or_file=None, url=None) -> pd.DataFrame:
     return df
 
 # DEMO data source (no uploader)
-# DEMO data source (same folder as this script)
 DEFAULT_DATA_PATH = Path(__file__).parent / "Global_Superstore2.csv"
-
-# ✅ Safe handling: ignore st.secrets if not found; fallback to env
-DATA_URL = None
-try:
-    if hasattr(st, "secrets") and "DATA_URL" in st.secrets:
-        DATA_URL = st.secrets["DATA_URL"]
-    else:
-        DATA_URL = os.getenv("DATA_URL", None)
-except Exception:
+DATA_URL = st.secrets.get("DATA_URL", None) if hasattr(st, "secrets") else None
+if DATA_URL is None:
     DATA_URL = os.getenv("DATA_URL", None)
 
-# ✅ Priority: Local file > URL > Error
 if DEFAULT_DATA_PATH.exists():
-    df = load_df_v2(DEFAULT_DATA_PATH)
+    df = load_df_v2(DEFAULT_DATA_PATH, url=None)
     st.caption(f"Loaded demo data from: {DEFAULT_DATA_PATH}")
 elif DATA_URL:
-    df = load_df_v2(url=DATA_URL)
+    df = load_df_v2(path_or_file=None, url=DATA_URL)
     st.caption("Loaded demo data from external URL (DATA_URL).")
 else:
-    st.error(
-        "⚠️ Demo data not found.\n"
-        "• Add file at: data/Global_Superstore2.csv\n"
-        "• Or set a DATA_URL in environment variables."
-    )
+    st.error("⚠️ Demo data not found.\n• أضف ملفك إلى: data/Global_Superstore2.csv\n• أو ضعي رابط CSV في Secrets/Env باسم DATA_URL")
     st.stop()
-
-
 
 # ---------------------- Diagnostics ----------------------
 st.subheader("📄 Data Preview")
@@ -355,13 +339,30 @@ with tabs[1]:
             color_by = st.selectbox("Color by", options=[None] + cat_cols_all, key="mv_color")
             st.plotly_chart(px.scatter(df, x=nx, y=ny, color=color_by, size=size_col, title=f"{nx} vs {ny} (colored)"), use_container_width=True)
         # Facet grid (category vs time)
-        if "order_yearmonth" in df.columns and "profit" in df.columns and cat_cols_all:
-            cat_f = st.selectbox("Facet by", options=cat_cols_all, key="mv_facet")
-            ts2 = df.groupby(["order_yearmonth", cat_f])["profit"].sum().reset_index()
-            st.plotly_chart(px.line(ts2, x="order_yearmonth", y="profit", facet_col=cat_f, facet_col_wrap=3,
-                                    title=f"Monthly Profit by {cat_f}"), use_container_width=True)
+        
+if "order_yearmonth" in df.columns and "profit" in df.columns and cat_cols_all:
+    cat_f = st.selectbox("Facet by", options=cat_cols_all, key="mv_facet")
+    ts2 = df.groupby(["order_yearmonth", cat_f])["profit"].sum().reset_index()
+
+    # Avoid Plotly vertical spacing error by capping facets and setting spacing to 0
+    max_facets = st.slider("Max facets (to avoid overcrowding)", 3, 24, 12, 1, key="mv_maxfacets")
+    top_cats = (df.groupby(cat_f)["profit"].sum()
+                  .sort_values(ascending=False).head(max_facets).index)
+    ts2f = ts2[ts2[cat_f].isin(top_cats)]
+    nfacets = ts2f[cat_f].nunique()
+
+    if nfacets <= 1:
+        fig = px.line(ts2f, x="order_yearmonth", y="profit",
+                      title=f"Monthly Profit by {cat_f}")
+    else:
+        fig = px.line(ts2f, x="order_yearmonth", y="profit",
+                      facet_col=cat_f, facet_col_wrap=3,
+                      facet_row_spacing=0.0, facet_col_spacing=0.02,
+                      title=f"Monthly Profit by {cat_f} (top {nfacets})")
+    st.plotly_chart(fig, use_container_width=True)
+
         # Scatter matrix for top numeric subset
-        if len(num_cols_all) >= 3:
+    if len(num_cols_all) >= 3:
             few = num_cols_all[:5]
             st.plotly_chart(px.scatter_matrix(df, dimensions=few, title="Scatter Matrix (top numeric)"), use_container_width=True)
 

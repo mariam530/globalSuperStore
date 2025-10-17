@@ -1,11 +1,11 @@
 
-
 # app.py
 # ============================================================
 # Streamlit: Full Analysis + Profit Modeling (Classification & Regression)
 # ============================================================
 import io
 import os
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -38,31 +38,69 @@ with st.sidebar:
     random_state = st.number_input("Random State", min_value=0, value=42, step=1)
     downsample = st.checkbox("Speed mode: downsample to 20k rows if larger", value=True)
     st.markdown("---")
-    st.caption("CSV with a `profit` column is required. Dates will be auto-parsed when possible.")
+    st.caption("Demo data loads automatically. No upload needed.")
     st.markdown("---")
     show_all = st.checkbox("🧾 Show everything on one page", value=False)
     show_diag = st.checkbox("🔧 Show diagnostics (columns & dtypes)", value=True)
 
-uploaded = st.file_uploader("Upload CSV", type=["csv"])
-if uploaded is None:
-    st.info("Upload a CSV to begin.")
-    st.stop()
-
-# ---------------------- Load & Clean ----------------------
+# ---------------------- Load & Clean (Demo Mode only) ----------------------
 @st.cache_data(show_spinner=False)
-def load_df_v2(file) -> pd.DataFrame:
-    """Robust CSV loader for Streamlit UploadedFile:
-    - Reads raw bytes once, retries with multiple encodings.
-    - Tries delimiter inference first (sep=None, engine='python'), then common seps.
+def load_df_v2(path_or_file=None, url=None) -> pd.DataFrame:
+    """
+    Robust CSV loader:
+    - If 'path_or_file' is a path (str/Path), read bytes from disk.
+    - If it's a file-like (UploadedFile/BytesIO), read raw bytes.
+    - Else, if 'url' is provided, read from URL.
+    - Tries multiple encodings + delimiter inference (sep=None, engine='python').
     - Normalizes column names & parses date-like columns.
     """
-    # 1) read raw bytes once (avoid pointer issues with UploadedFile)
-    raw = file.read() if hasattr(file, "read") else file
-    if hasattr(file, "seek"):
-        file.seek(0)
+    raw = None
 
+    # 1) Resolve source to raw bytes
+    if path_or_file is not None:
+        # Path on disk
+        if isinstance(path_or_file, (str, Path)):
+            p = Path(path_or_file)
+            with p.open("rb") as f:
+                raw = f.read()
+        # File-like
+        elif hasattr(path_or_file, "read"):
+            raw = path_or_file.read()
+            if hasattr(path_or_file, "seek"):
+                path_or_file.seek(0)
+        else:
+            raise ValueError("Unsupported path_or_file type.")
+    elif url:
+        # pandas will fetch URL internally; we'll decode with fallback encodings below
+        for enc in ["Windows-1252", "utf-8", "latin1", "ISO-8859-1", "cp1256"]:
+            try:
+                df_try = pd.read_csv(url, encoding=enc, sep=None, engine="python")
+                df = df_try
+                used_enc, used_sep = enc, "inferred"
+                break
+            except Exception:
+                df = None
+        if df is None:
+            st.error("❌ Failed to read CSV from URL. Check DATA_URL.")
+            st.stop()
+        # normalize names & parse dates
+        df.columns = (df.columns.str.strip()
+                      .str.replace(r"[()\s]+", "_", regex=True)
+                      .str.lower())
+        for c in df.columns:
+            if any(k in c for k in ["date", "order", "ship"]):
+                try:
+                    df[c] = pd.to_datetime(df[c], errors="ignore")
+                except Exception:
+                    pass
+        st.caption(f"Loaded from URL | Encoding: {used_enc} | Separator: {used_sep} | Shape: {df.shape[0]:,} x {df.shape[1]}")
+        return df
+    else:
+        st.error("No demo data source specified.")
+        st.stop()
+
+    # 2) Try encodings + delimiter inference on raw bytes
     encodings = ["Windows-1252", "utf-8", "latin1", "ISO-8859-1", "cp1256"]
-    seps = [None, ",", ";", "\t", "|"]  # None → infer with engine='python'
     last_err = None
     df = None
     used_enc, used_sep = None, None
@@ -120,23 +158,48 @@ def load_df_v2(file) -> pd.DataFrame:
     st.caption(f"Decoded with: {used_enc} | Separator: {used_sep} | Shape: {df.shape[0]:,} x {df.shape[1]}")
     return df
 
+# DEMO data source (no uploader)
+# DEMO data source (same folder as this script)
+DEFAULT_DATA_PATH = Path(__file__).parent / "Global_Superstore2.csv"
 
-df = load_df_v2(uploaded)
+# ✅ Safe handling: ignore st.secrets if not found; fallback to env
+DATA_URL = None
+try:
+    if hasattr(st, "secrets") and "DATA_URL" in st.secrets:
+        DATA_URL = st.secrets["DATA_URL"]
+    else:
+        DATA_URL = os.getenv("DATA_URL", None)
+except Exception:
+    DATA_URL = os.getenv("DATA_URL", None)
 
+# ✅ Priority: Local file > URL > Error
+if DEFAULT_DATA_PATH.exists():
+    df = load_df_v2(DEFAULT_DATA_PATH)
+    st.caption(f"Loaded demo data from: {DEFAULT_DATA_PATH}")
+elif DATA_URL:
+    df = load_df_v2(url=DATA_URL)
+    st.caption("Loaded demo data from external URL (DATA_URL).")
+else:
+    st.error(
+        "⚠️ Demo data not found.\n"
+        "• Add file at: data/Global_Superstore2.csv\n"
+        "• Or set a DATA_URL in environment variables."
+    )
+    st.stop()
+
+
+
+# ---------------------- Diagnostics ----------------------
 st.subheader("📄 Data Preview")
 st.write(df.head())
 st.write(f"Rows: {len(df):,} | Columns: {len(df.columns)}")
 
-# Diagnostics panel
 if show_diag:
     with st.expander("🔧 Diagnostics: columns & dtypes", expanded=True):
         st.write("**Columns:**", list(df.columns))
         dtypes_df = pd.DataFrame({"column": df.columns, "dtype": df.dtypes.astype(str).values})
         st.write(dtypes_df)
         st.dataframe(df.head(20), use_container_width=True)
-
-# Profit column (assumed present as 'Profit' in raw → becomes 'profit' after normalization)
-# No blocking checks; proceed directly.
 
 # Optional downsample
 if downsample and len(df) > 20_000:
@@ -196,68 +259,6 @@ def add_features(X: pd.DataFrame) -> pd.DataFrame:
             labels=["Low", "Mid", "High", "Premium"]
         )
     return X
-
-
-df = add_features(df)
-
-# ============================================================
-#                         TABS
-# ============================================================
-
-
-# ---------------------- Feature Engineering ----------------------
-def add_features(X: pd.DataFrame) -> pd.DataFrame:
-    X = X.copy()
-
-    # Unit price & gross margin
-    if {"sales", "quantity"}.issubset(X.columns):
-        X["unit_price"] = np.where(pd.to_numeric(X["quantity"], errors="coerce") > 0,
-                                   pd.to_numeric(X.get("sales"), errors="coerce") /
-                                   pd.to_numeric(X.get("quantity"), errors="coerce"),
-                                   np.nan)
-    if {"profit", "sales"}.issubset(X.columns):
-        sales = pd.to_numeric(X["sales"], errors="coerce")
-        profit = pd.to_numeric(X["profit"], errors="coerce")
-        X["gross_margin_pct"] = np.where(sales != 0, profit / sales, np.nan)
-
-    # Discount cleanup
-    if "discount" in X.columns:
-        X["discount_pct"] = pd.to_numeric(X["discount"], errors="coerce").clip(lower=0, upper=1)
-        X["discount_level"] = pd.cut(
-            X["discount_pct"],
-            bins=[-0.001, 0.0, 0.10, 0.20, 0.30, 1.0],
-            labels=["0%", "0-10%", "10-20%", "20-30%", "30%+"]
-        )
-
-    # Profitable flag
-    X["is_profitable"] = (pd.to_numeric(X["profit"], errors="coerce") > 0).astype(int)
-
-    # Ship delay
-    if "order_date" in X.columns and "ship_date" in X.columns:
-        if pd.api.types.is_datetime64_any_dtype(X["order_date"]) and pd.api.types.is_datetime64_any_dtype(X["ship_date"]):
-            X["ship_delay_days"] = (X["ship_date"] - X["order_date"]).dt.days
-
-    # Date parts from order_date
-    if "order_date" in X.columns and pd.api.types.is_datetime64_any_dtype(X["order_date"]):
-        od = X["order_date"]
-        X["order_year"] = od.dt.year
-        X["order_month"] = od.dt.month
-        X["order_quarter"] = od.dt.quarter
-        X["order_yearmonth"] = od.dt.to_period("M").astype(str)
-        X["order_weekday"] = od.dt.day_name()
-        X["order_dow"] = od.dt.dayofweek
-        X["order_weekend"] = X["order_dow"].isin([5, 6]).astype(int)
-
-    # Unit price bands
-    if "unit_price" in X.columns:
-        q = X["unit_price"].quantile([0.25, 0.5, 0.75])
-        X["unitprice_band"] = pd.cut(
-            X["unit_price"],
-            bins=[-np.inf, q.iloc[0], q.iloc[1], q.iloc[2], np.inf],
-            labels=["Low", "Mid", "High", "Premium"]
-        )
-    return X
-
 
 df = add_features(df)
 
@@ -386,6 +387,7 @@ with tabs[2]:
         color = st.selectbox("Color (optional)", options=[None] + df.columns.tolist())
         fig = px.scatter(df, x=col_x, y=col_y, color=color, title=f"Scatter: {col_x} vs {col_y}")
         st.plotly_chart(fig, use_container_width=True)
+
 # ---------------------- Classification Tab ----------------------
 with tabs[3]:
     st.header("🔎 Classification: profit > 0")
@@ -522,7 +524,7 @@ with tabs[4]:
         rmse = np.sqrt(mean_squared_error(y_test, y_pred))
 
     r1, r2, r3 = st.columns(3)
-    r1.metric("R²", f"{r2_score(y_test, y_pred):.3f}")
+    r1.metric("R²", f"{r2_score(y_test, y_pred):.3f}")  # <-- FIX BELOW
     r2.metric("MAE", f"{mean_absolute_error(y_test, y_pred):.3f}")
     r3.metric("RMSE", f"{rmse:.3f}")
 
@@ -546,7 +548,7 @@ with tabs[5]:
     else:
         st.info("unitprice_band not available — it appears when `sales` and `quantity` exist.")
 
-# ---------------------- One‑Page (optional) ----------------------
+# ---------------------- One-Page (optional) ----------------------
 if show_all:
     st.markdown("---")
     st.header("🧾 Full Page View")
@@ -561,7 +563,7 @@ if show_all:
         except Exception:
             pass
 
-    # 2) Time series (if available)
+    # 2) Time series 
     if "order_yearmonth" in df.columns:
         _metric = "profit" if "profit" in df.columns else (_num.columns[0] if not _num.empty else None)
         if _metric:
@@ -579,6 +581,5 @@ if show_all:
         _vc = (df[_cx].value_counts(dropna=False).rename_axis(_cx).reset_index(name="count"))
         _vc = _vc[_vc[_cx].notna()]
         st.plotly_chart(px.bar(_vc, x=_cx, y="count", title=f"Counts by {_cx}"), use_container_width=True)
-
 
 

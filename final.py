@@ -3,6 +3,7 @@
 # Streamlit: Profit Analysis & Modeling + Manual Prediction
 # ============================================================
 import io
+import os
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -31,6 +32,9 @@ try:
 except Exception:
     HAS_SM = False
 
+# Show full error details in Streamlit (useful while debugging)
+st.set_option("client.showErrorDetails", True)
+
 # ---------------------- App Config ----------------------
 st.set_page_config(page_title="Profit Analysis & Modeling", layout="wide")
 st.title("📊 Profit Analysis & Modeling")
@@ -42,7 +46,7 @@ with st.sidebar:
     random_state = st.number_input("Random State", min_value=0, value=42, step=1)
     downsample = st.checkbox("Speed mode: downsample to 20k rows if larger", value=True)
     st.markdown("---")
-    st.caption("Using local CSV: Global_Superstore2.csv (latin1). Dates will be auto-parsed when possible.")
+    st.caption("Using CSV: Global_Superstore2.csv (tries utf-8 → latin1 → cp1252). Dates auto-parsed when possible.")
 
 # ---------------------- Helpers ----------------------
 def _ohe_sparse():
@@ -160,8 +164,36 @@ def _build_quick_reg_pipeline(X_df, y, random_state=42):
     reg.fit(X_local, y)
     return reg, num_cols, cat_cols
 
-# ---------------------- Load & Clean ----------------------
-df = pd.read_csv("Global_Superstore2.csv", encoding="latin1")
+# ---------------------- Load & Clean (robust) ----------------------
+def safe_read_csv(default_path: str) -> pd.DataFrame:
+    # If file is missing, let the user upload one instead of crashing
+    if not os.path.exists(default_path):
+        st.warning(f"CSV not found at: `{default_path}`. Upload a CSV below or place the file next to final.py.")
+        uploaded = st.file_uploader("Upload CSV", type=["csv"])
+        if uploaded is None:
+            st.stop()
+        # Try multiple encodings for uploaded file
+        for enc in ["utf-8", "latin1", "cp1252"]:
+            try:
+                return pd.read_csv(uploaded, encoding=enc)
+            except Exception:
+                continue
+        st.error("Could not read the uploaded CSV with utf-8 / latin1 / cp1252 encodings.")
+        st.stop()
+
+    # File exists locally — try multiple encodings
+    last_err = None
+    for enc in ["utf-8", "latin1", "cp1252"]:
+        try:
+            return pd.read_csv(default_path, encoding=enc)
+        except Exception as e:
+            last_err = e
+            continue
+    st.error(f"Failed to read `{default_path}` with utf-8/latin1/cp1252. Last error: {last_err}")
+    st.stop()
+
+# Use the safer loader
+df = safe_read_csv("Global_Superstore2.csv")
 df = _normalize_columns(df)
 df = _auto_parse_dates(df)
 
@@ -642,6 +674,7 @@ with tabs[6]:
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("unitprice_band not available — it appears when `sales` and `quantity` exist.")
+
 
 
 

@@ -3,7 +3,6 @@
 # Streamlit: Profit Analysis & Modeling + Manual Prediction
 # ============================================================
 import io
-import os
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -27,14 +26,13 @@ from sklearn.ensemble import (
 
 # ---------- Optional: enable Plotly trendline if statsmodels is installed ----------
 try:
-    import statsmodels.api as sm  # noqa: F401
+    import statsmodels.api as sm  
     HAS_SM = True
 except Exception:
     HAS_SM = False
 
 # ---------------------- App Config ----------------------
-st.set_page_config(page_title="Profit Analysis & Modeling", layout="wide")  # MUST be first Streamlit call
-st.set_option("client.showErrorDetails", True)  # now safe after set_page_config
+st.set_page_config(page_title="Profit Analysis & Modeling", layout="wide")
 st.title("📊 Profit Analysis & Modeling")
 
 # ---------------------- Sidebar ----------------------
@@ -44,7 +42,7 @@ with st.sidebar:
     random_state = st.number_input("Random State", min_value=0, value=42, step=1)
     downsample = st.checkbox("Speed mode: downsample to 20k rows if larger", value=True)
     st.markdown("---")
-    st.caption("Using CSV: Global_Superstore2.csv (tries utf-8 → latin1 → cp1252). Dates auto-parsed when possible.")
+    st.caption("Using local CSV: Global_Superstore2.csv (latin1). Dates will be auto-parsed when possible.")
 
 # ---------------------- Helpers ----------------------
 def _ohe_sparse():
@@ -162,36 +160,8 @@ def _build_quick_reg_pipeline(X_df, y, random_state=42):
     reg.fit(X_local, y)
     return reg, num_cols, cat_cols
 
-# ---------------------- Load & Clean (robust) ----------------------
-def safe_read_csv(default_path: str) -> pd.DataFrame:
-    # If file is missing, let the user upload one instead of crashing
-    if not os.path.exists(default_path):
-        st.warning(f"CSV not found at: `{default_path}`. Upload a CSV below or place the file next to final.py.")
-        uploaded = st.file_uploader("Upload CSV", type=["csv"])
-        if uploaded is None:
-            st.stop()
-        # Try multiple encodings for uploaded file
-        for enc in ["utf-8", "latin1", "cp1252"]:
-            try:
-                return pd.read_csv(uploaded, encoding=enc)
-            except Exception:
-                continue
-        st.error("Could not read the uploaded CSV with utf-8 / latin1 / cp1252 encodings.")
-        st.stop()
-
-    # File exists locally — try multiple encodings
-    last_err = None
-    for enc in ["utf-8", "latin1", "cp1252"]:
-        try:
-            return pd.read_csv(default_path, encoding=enc)
-        except Exception as e:
-            last_err = e
-            continue
-    st.error(f"Failed to read `{default_path}` with utf-8/latin1/cp1252. Last error: {last_err}")
-    st.stop()
-
-# Use the safer loader
-df = safe_read_csv("Global_Superstore2.csv")
+# ---------------------- Load & Clean ----------------------
+df = pd.read_csv("Global_Superstore2.csv", encoding="latin1")
 df = _normalize_columns(df)
 df = _auto_parse_dates(df)
 
@@ -207,7 +177,6 @@ if "profit" not in df.columns:
         st.error("Column 'profit' not found. Please ensure your dataset has a 'profit' column.")
         st.stop()
 
-# Optional downsample
 if downsample and len(df) > 20_000:
     df = df.sample(20_000, random_state=random_state).reset_index(drop=True)
     st.warning("Dataset downsampled to 20,000 rows for speed.")
@@ -309,7 +278,7 @@ with tabs[1]:
             st.write(g.head(50))
             fig = px.bar(g.head(50), x=col_x, y=col_y,
                          color=color_opt if color_opt in g.columns else None,
-                         title=f"{agg_func.UPPER()}({col_y}) by {col_x}")
+                         title=f"{agg_func.upper()}({col_y}) by {col_x}")
             st.plotly_chart(fig, use_container_width=True)
         elif pd.api.types.is_numeric_dtype(df[col_x]) and (not pd.api.types.is_numeric_dtype(df[col_y])):
             agg_func = st.selectbox("Aggregation", ["sum", "mean", "median", "count"], index=1, key="bi_agg_swap")
@@ -317,7 +286,7 @@ with tabs[1]:
             st.write(g.head(50))
             fig = px.bar(g.head(50), x=col_y, y=col_x,
                          color=color_opt if color_opt in g.columns else None,
-                         title=f"{agg_func.UPPER()}({col_x}) by {col_y}")
+                         title=f"{agg_func.upper()}({col_x}) by {col_y}")
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Both selected columns are categorical — showing count table.")
@@ -423,10 +392,8 @@ with tabs[3]:
         if pd.api.types.is_datetime64_any_dtype(X[c]):
             X[c] = pd.to_datetime(X[c], errors="coerce").dt.to_period("M").astype(str)
 
-    # ✅ FIX: Use stratify only when there are >= 2 classes
-    stratify_y = y if pd.Series(y).nunique() >= 2 else None
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=random_state, stratify=stratify_y
+        X, y, test_size=test_size, random_state=random_state, stratify=y
     )
 
     num_cols = X_train.select_dtypes(include=[np.number, "bool", "boolean"]).columns.tolist()
@@ -547,26 +514,22 @@ with tabs[4]:
                        out_df.to_csv(index=False).encode(),
                        file_name="profit_regression_preds.csv")
 
-# ---------------------- Manual Prediction Tab (Predict profit on input) ----------------------
+# ---------------------- Manual Prediction Tab ----------------------
 with tabs[5]:
-    st.header("📝 Manual Prediction — Predict profit from a single row")
+    st.header("📝 Manual Prediction (single row)")
 
     df_ref = df.copy()
-
-    # We EXCLUDE 'profit' from manual inputs (we're predicting it)
     requested_cols = [
         "segment", "city", "state", "country", "postal_code", "market", "region",
         "product_id", "category", "sub_category", "product_name",
-        "sales", "quantity", "discount", "shipping_cost", "order_priority"
+        "sales", "quantity", "discount", "profit", "shipping_cost", "order_priority"
     ]
     available = [c for c in requested_cols if c in df_ref.columns]
 
-    # Suggestions for categoricals (top-50)
     cat_suggestions = {}
     for c in df_ref.select_dtypes(include=["object", "category"]).columns:
         cat_suggestions[c] = list(df_ref[c].dropna().astype(str).value_counts().head(50).index)
 
-    # Numeric defaults (median)
     num_defaults = {}
     for c in df_ref.select_dtypes(include=[np.number, "bool", "boolean"]).columns:
         try:
@@ -574,8 +537,7 @@ with tabs[5]:
         except Exception:
             num_defaults[c] = 0.0
 
-    # Split manual inputs
-    numeric_fields = [c for c in ["sales","quantity","discount","shipping_cost"] if c in available]
+    numeric_fields = [c for c in ["sales","quantity","discount","profit","shipping_cost"] if c in available]
     categorical_fields = [c for c in available if c not in numeric_fields]
 
     c1, c2 = st.columns(2)
@@ -602,59 +564,74 @@ with tabs[5]:
             else:
                 cat_inputs[col] = st.text_input(col, value="")
 
-    # Build single-row dataframe
     row = {}
     for k, v in num_inputs.items(): row[k] = v
     for k, v in cat_inputs.items(): row[k] = v if (v is not None and v != "") else None
     one = pd.DataFrame([row])
 
-    # Ensure all dataset columns exist for feature computation
     for m in set(df_ref.columns) - set(one.columns):
         one[m] = np.nan
 
-    # Normalize + parse dates + engineered features
     one = _normalize_columns(one)
     one = _auto_parse_dates(one)
     one = add_features(one)
 
     st.markdown("---")
-    st.subheader("📈 Predicted profit")
+    st.subheader("Choose task(s) and predict")
 
-    # Prepare X for regression: drop 'profit' (target) if exists
-    X_reg = one.drop(columns=["profit"], errors="ignore").copy()
-    # Convert datetimes to monthly strings for the pipeline
-    for c in X_reg.columns:
-        if pd.api.types.is_datetime64_any_dtype(X_reg[c]):
-            X_reg[c] = pd.to_datetime(X_reg[c], errors="coerce").dt.to_period("M").astype(str)
+    do_class = st.checkbox("🔎 Classification (profit > 0)", value=True)
+    do_reg   = st.checkbox("📈 Regression (predict profit value)", value=True)
 
-    # Use trained reg_pipe if available; otherwise build a quick one
-    try:
-        if "reg_pipe" in locals() and "num_cols_r" in locals() and "cat_cols_r" in locals():
-            rpipe = reg_pipe
-            needed_r = list(set(num_cols_r) | set(cat_cols_r))
+    if do_class:
+        st.markdown("### 🔎 Classification Result")
+        X_clf = one.copy()
+        LEAK_LIKE = {"profit", "is_profitable", "profit_bucket", "gross_margin_pct", "profitability_category"}
+        leak_cols = [c for c in X_clf.columns if (c.lower() in LEAK_LIKE) or ("profit" in c.lower())]
+        X_clf = X_clf.drop(columns=leak_cols, errors="ignore")
+        for c in X_clf.columns:
+            if pd.api.types.is_datetime64_any_dtype(X_clf[c]):
+                X_clf[c] = pd.to_datetime(X_clf[c], errors="coerce").dt.to_period("M").astype(str)
+
+        if "clf_pipe" in locals() and "num_cols" in locals() and "cat_cols" in locals():
+            pipe = clf_pipe; num_cols_ref, cat_cols_ref = num_cols, cat_cols
         else:
-            # Build a quick pipeline on the full dataset as a fallback
+            y_tmp = (pd.to_numeric(df_ref["profit"], errors="coerce") > 0).astype(int)
+            X_tmp = df_ref.copy()
+            X_tmp = X_tmp.drop(columns=leak_cols, errors="ignore")
+            pipe, num_cols_ref, cat_cols_ref = _build_quick_clf_pipeline(X_tmp, y_tmp, random_state=random_state)
+
+        needed = list(set(num_cols_ref) | set(cat_cols_ref))
+        for col in set(needed) - set(X_clf.columns): X_clf[col] = np.nan
+        X_align = X_clf[needed]
+
+        if hasattr(pipe, "predict_proba"):
+            proba = float(pipe.predict_proba(X_align)[:, 1][0])
+            pred  = int(proba >= 0.5)
+            st.write({"pred_class": pred, "proba": proba})
+        else:
+            pred = int(pipe.predict(X_align)[0])
+            st.write({"pred_class": pred})
+
+    if do_reg:
+        st.markdown("### 📈 Regression Result")
+        X_reg = one.drop(columns=["profit"], errors="ignore").copy()
+        for c in X_reg.columns:
+            if pd.api.types.is_datetime64_any_dtype(X_reg[c]):
+                X_reg[c] = pd.to_datetime(X_reg[c], errors="coerce").dt.to_period("M").astype(str)
+
+        if "reg_pipe" in locals() and "num_cols_r" in locals() and "cat_cols_r" in locals():
+            rpipe = reg_pipe; num_cols_ref_r, cat_cols_ref_r = num_cols_r, cat_cols_r
+        else:
             y_tmp = pd.to_numeric(df_ref["profit"], errors="coerce")
             X_tmp = df_ref.drop(columns=["profit"], errors="ignore").copy()
-            rpipe, num_cols_r_tmp, cat_cols_r_tmp = _build_quick_reg_pipeline(X_tmp, y_tmp, random_state=random_state)
-            needed_r = list(set(num_cols_r_tmp) | set(cat_cols_r_tmp))
+            rpipe, num_cols_ref_r, cat_cols_ref_r = _build_quick_reg_pipeline(X_tmp, y_tmp, random_state=random_state)
 
-        # Align manual row to training columns
-        for col in set(needed_r) - set(X_reg.columns):
-            X_reg[col] = np.nan
+        needed_r = list(set(num_cols_ref_r) | set(cat_cols_ref_r))
+        for col in set(needed_r) - set(X_reg.columns): X_reg[col] = np.nan
         X_align_r = X_reg[needed_r]
 
-        # Predict profit immediately
         y_pred_one = float(rpipe.predict(X_align_r)[0])
-        st.success(f"✅ Predicted profit: **{y_pred_one:,.2f}**")
-
-        # Optional: show the engineered row preview
-        with st.expander("Show engineered row"):
-            st.write(one)
-
-    except Exception as e:
-        st.error(f"Prediction failed: {e}")
-        st.caption("Tip: Open the 'Model: Regression' tab once to train a pipeline, or keep this auto mode (it builds a quick pipeline as needed).")
+        st.write({"y_pred_profit": y_pred_one})
 
 # ---------------------- Export Tab ----------------------
 with tabs[6]:

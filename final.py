@@ -26,7 +26,7 @@ from sklearn.ensemble import (
 
 # ---------- Optional: enable Plotly trendline if statsmodels is installed ----------
 try:
-    import statsmodels.api as sm  # noqa: F401
+    import statsmodels.api as sm  
     HAS_SM = True
 except Exception:
     HAS_SM = False

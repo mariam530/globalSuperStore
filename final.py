@@ -24,7 +24,7 @@ from sklearn.ensemble import (
     RandomForestRegressor, GradientBoostingRegressor
 )
 
-# ---------- Optional: enable Plotly trendline if statsmodels is installed ----------
+# ----------  enable Plotly trendline if statsmodels is installed ----------
 try:
     import statsmodels.api as sm  # noqa: F401
     HAS_SM = True
@@ -408,7 +408,7 @@ with tabs[3]:
         sparse_threshold=1.0
     )
 
-    # RandomForest first (default)
+    # RandomForest first 
     model_name = st.selectbox(
         "Model",
         ["RandomForest", "LogisticRegression", "GradientBoosting"]
@@ -520,7 +520,7 @@ with tabs[5]:
 
     df_ref = df.copy()
 
-    # We EXCLUDE 'profit' from manual inputs (we're predicting it)
+    # EXCLUDE 'profit' from manual inputs ( predicting it)
     requested_cols = [
         "segment", "city", "state", "country", "postal_code", "market", "region",
         "product_id", "category", "sub_category", "product_name",

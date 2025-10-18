@@ -1,7 +1,7 @@
 # app.py
 # ============================================================
 # Streamlit: Full Analysis + Profit Modeling (Classification & Regression)
-# + Inference on new CSV/XLSX files
+# + Manual Prediction (single row, no file upload)
 # ============================================================
 import io
 import numpy as np
@@ -40,6 +40,7 @@ with st.sidebar:
 
 # ---------------------- Helpers ----------------------
 def _ohe_sparse():
+    """OneHotEncoder compatible across sklearn versions."""
     try:
         return OneHotEncoder(handle_unknown="ignore", sparse_output=True, dtype=np.float32)
     except TypeError:
@@ -68,61 +69,8 @@ def _auto_parse_dates(df: pd.DataFrame) -> pd.DataFrame:
             pass
     return df
 
-def _load_new_table(file) -> pd.DataFrame:
-    """Load CSV/Excel for inference (uploader)."""
-    name = file.name.lower()
-    if name.endswith((".xlsx", ".xls")):
-        df_new = pd.read_excel(file, engine=None)
-        return _auto_parse_dates(_normalize_columns(df_new))
-    raw = file.read()
-    for enc in ["utf-8","utf-8-sig","latin1","iso-8859-1","windows-1256"]:
-        for sep in [None, ",",";","\t","|"]:
-            try:
-                bio = io.BytesIO(raw)
-                df_new = pd.read_csv(bio, encoding=enc, sep=sep, engine="python")
-                return _auto_parse_dates(_normalize_columns(df_new))
-            except Exception:
-                continue
-    bio = io.BytesIO(raw)
-    df_new = pd.read_csv(bio, engine="python")
-    return _auto_parse_dates(_normalize_columns(df_new))
-
-def _align_for_inference(df_new: pd.DataFrame, num_cols_ref, cat_cols_ref) -> pd.DataFrame:
-    """Match new-data columns to training schema; convert datetimes to 'M' strings."""
-    df_new = df_new.copy()
-    for c in df_new.columns:
-        if pd.api.types.is_datetime64_any_dtype(df_new[c]):
-            df_new[c] = pd.to_datetime(df_new[c], errors="coerce").dt.to_period("M").astype(str)
-    needed = set(num_cols_ref) | set(cat_cols_ref)
-    for c in needed - set(df_new.columns):
-        df_new[c] = np.nan
-    return df_new
-
-# ---------------------- Load & Clean (direct file) ----------------------
-df = pd.read_csv("Global_Superstore2.csv", encoding="latin1")
-df = _normalize_columns(df)
-df = _auto_parse_dates(df)
-
-st.subheader("📄 Data Preview")
-st.write(df.head())
-st.write(f"Rows: {len(df):,} | Columns: {len(df.columns)}")
-
-# Ensure profit column
-if "profit" not in df.columns:
-    cand = [c for c in df.columns if c.lower() == "profit"]
-    if cand:
-        df = df.rename(columns={cand[0]: "profit"})
-    else:
-        st.error("Column 'profit' not found. Please ensure your dataset has a 'profit' column.")
-        st.stop()
-
-# Optional downsample
-if downsample and len(df) > 20_000:
-    df = df.sample(20_000, random_state=random_state).reset_index(drop=True)
-    st.warning("Dataset downsampled to 20,000 rows for speed.")
-
-# ---------------------- Feature Engineering ----------------------
 def add_features(X: pd.DataFrame) -> pd.DataFrame:
+    """Domain features used across the app."""
     X = X.copy()
     # Unit price & gross margin
     if {"sales", "quantity"}.issubset(X.columns):
@@ -134,15 +82,17 @@ def add_features(X: pd.DataFrame) -> pd.DataFrame:
         profit = pd.to_numeric(X["profit"], errors="coerce")
         X["gross_margin_pct"] = np.where(sales != 0, profit / sales, np.nan)
     # Discount cleanup
-    if "discount" in X.columns:
+    if "discount" in X.columns and "discount_pct" not in X.columns:
         X["discount_pct"] = pd.to_numeric(X["discount"], errors="coerce").clip(lower=0, upper=1)
+    if "discount_pct" in X.columns:
         X["discount_level"] = pd.cut(
-            X["discount_pct"],
+            pd.to_numeric(X["discount_pct"], errors="coerce"),
             bins=[-0.001, 0.0, 0.10, 0.20, 0.30, 1.0],
             labels=["0%", "0-10%", "10-20%", "20-30%", "30%+"]
         )
     # Profitable flag
-    X["is_profitable"] = (pd.to_numeric(X["profit"], errors="coerce") > 0).astype(int)
+    if "profit" in X.columns:
+        X["is_profitable"] = (pd.to_numeric(X["profit"], errors="coerce") > 0).astype(int)
     # Ship delay
     if "order_date" in X.columns and "ship_date" in X.columns:
         if pd.api.types.is_datetime64_any_dtype(X["order_date"]) and pd.api.types.is_datetime64_any_dtype(X["ship_date"]):
@@ -170,13 +120,78 @@ def add_features(X: pd.DataFrame) -> pd.DataFrame:
             pass
     return X
 
+def _build_quick_clf_pipeline(X_df, y, random_state=42):
+    """Quick fallback pipeline if classification tab wasn't visited yet."""
+    X_local = X_df.copy()
+    for c in X_local.columns:
+        if pd.api.types.is_datetime64_any_dtype(X_local[c]):
+            X_local[c] = pd.to_datetime(X_local[c], errors="coerce").dt.to_period("M").astype(str)
+    num_cols = X_local.select_dtypes(include=[np.number, "bool", "boolean"]).columns.tolist()
+    cat_cols = X_local.select_dtypes(exclude=[np.number, "bool", "boolean"]).columns.tolist()
+    preprocess = ColumnTransformer(
+        [
+            ("num", Pipeline([("imp", SimpleImputer(strategy="median")), ("scale", MaxAbsScaler())]), num_cols),
+            ("cat", Pipeline([("imp", SimpleImputer(strategy="most_frequent")), ("ohe", _ohe_sparse())]), cat_cols),
+        ],
+        remainder="drop", sparse_threshold=1.0
+    )
+    clf = Pipeline([("prep", preprocess), ("clf", LogisticRegression(max_iter=1000))])
+    clf.fit(X_local, y)
+    return clf, num_cols, cat_cols
+
+def _build_quick_reg_pipeline(X_df, y, random_state=42):
+    """Quick fallback pipeline if regression tab wasn't visited yet."""
+    X_local = X_df.copy()
+    for c in X_local.columns:
+        if pd.api.types.is_datetime64_any_dtype(X_local[c]):
+            X_local[c] = pd.to_datetime(X_local[c], errors="coerce").dt.to_period("M").astype(str)
+    num_cols = X_local.select_dtypes(include=[np.number, "bool", "boolean"]).columns.tolist()
+    cat_cols = X_local.select_dtypes(exclude=[np.number, "bool", "boolean"]).columns.tolist()
+    preprocess = ColumnTransformer(
+        [
+            ("num", Pipeline([("imp", SimpleImputer(strategy="median")), ("scale", MaxAbsScaler())]), num_cols),
+            ("cat", Pipeline([("imp", SimpleImputer(strategy="most_frequent")), ("ohe", _ohe_sparse())]), cat_cols),
+        ],
+        remainder="drop", sparse_threshold=1.0
+    )
+    reg = Pipeline([("prep", preprocess), ("reg", RandomForestRegressor(n_estimators=300, random_state=random_state, n_jobs=-1))])
+    reg.fit(X_local, y)
+    return reg, num_cols, cat_cols
+
+# ---------------------- Load & Clean (direct file) ----------------------
+df = pd.read_csv("Global_Superstore2.csv", encoding="latin1")
+df = _normalize_columns(df)
+df = _auto_parse_dates(df)
+
+st.subheader("📄 Data Preview")
+st.write(df.head())
+st.write(f"Rows: {len(df):,} | Columns: {len(df.columns)}")
+
+# Ensure profit column
+if "profit" not in df.columns:
+    cand = [c for c in df.columns if c.lower() == "profit"]
+    if cand:
+        df = df.rename(columns={cand[0]: "profit"})
+    else:
+        st.error("Column 'profit' not found. Please ensure your dataset has a 'profit' column.")
+        st.stop()
+
+# Optional downsample
+if downsample and len(df) > 20_000:
+    df = df.sample(20_000, random_state=random_state).reset_index(drop=True)
+    st.warning("Dataset downsampled to 20,000 rows for speed.")
+
+# Feature engineering
 df = add_features(df)
 
 # ============================================================
 #                         TABS
 # ============================================================
 tabs = st.tabs([
-    "Overview", "Analysis", "Visualizations", "Model: Classification", "Model: Regression", "Export"
+    "Overview", "Analysis", "Visualizations",
+    "Model: Classification", "Model: Regression",
+    "Manual Prediction",  # NEW
+    "Export"
 ])
 
 # ---------------------- Overview Tab ----------------------
@@ -254,29 +269,6 @@ with tabs[1]:
     else:
         st.info("ship_delay_days not available to plot.")
 
-# ---------------------- Visualizations Tab ----------------------
-with tabs[2]:
-    st.subheader("Quick Visualizations")
-    col_x = st.selectbox("X", options=df.columns, index=list(df.columns).index("unitprice_band") if "unitprice_band" in df.columns else 0)
-    kind = st.selectbox("Chart type", ["Bar (counts)", "Histogram", "Box", "Scatter"])
-    if kind == "Bar (counts)":
-        vc = (df[col_x].value_counts(dropna=False)
-              .rename_axis(col_x).reset_index(name="count"))
-        vc = vc[vc[col_x].notna()]
-        fig = px.bar(vc, x=col_x, y="count", title=f"Counts by {col_x}")
-        st.plotly_chart(fig, use_container_width=True)
-    elif kind == "Histogram":
-        fig = px.histogram(df, x=col_x, title=f"Histogram: {col_x}")
-        st.plotly_chart(fig, use_container_width=True)
-    elif kind == "Box":
-        fig = px.box(df, y=col_x, title=f"Box: {col_x}")
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        col_y = st.selectbox("Y", options=df.columns, index=list(df.columns).index("profit") if "profit" in df.columns else 1)
-        color = st.selectbox("Color (optional)", options=[None] + df.columns.tolist())
-        fig = px.scatter(df, x=col_x, y=col_y, color=color, title=f"Scatter: {col_x} vs {col_y}")
-        st.plotly_chart(fig, use_container_width=True)
-
 # ---------------------- Classification Tab ----------------------
 with tabs[3]:
     st.header("🔎 Classification: profit > 0")
@@ -339,7 +331,7 @@ with tabs[3]:
                           index=pd.Index(["True 0","True 1"], name="Actual"),
                           columns=pd.Index(["Pred 0","Pred 1"], name="Predicted")))
 
-    # Threshold tuning
+    # Threshold tuning (if available)
     thr = 0.5
     if hasattr(clf_pipe, "predict_proba"):
         st.subheader("🎚️ Threshold Tuning (maximize F1)")
@@ -355,33 +347,6 @@ with tabs[3]:
         st.download_button("⬇️ Download classification predictions (CSV)",
                            out_df.to_csv(index=False).encode(),
                            file_name="profit_classification_preds.csv")
-
-    # ===================== PREDICTION ON NEW DATA (Classification) =====================
-    st.markdown("---")
-    st.subheader("🧪 Predict on new data (Classification)")
-    upl_c = st.file_uploader("Upload CSV/XLSX for classification prediction", type=["csv","xlsx","xls"], key="upl_clf")
-    if upl_c is not None:
-        new_df = _load_new_table(upl_c)
-        new_df = _align_for_inference(new_df, num_cols, cat_cols)
-        # Drop leakage columns if present
-        new_df = new_df.drop(columns=[c for c in new_df.columns if (c.lower() in LEAK_LIKE) or ("profit" in c.lower())], errors="ignore")
-
-        if hasattr(clf_pipe, "predict_proba"):
-            thr_used = thr  # use slider value
-            p = clf_pipe.predict_proba(new_df)[:, 1]
-            pred = (p >= thr_used).astype(int)
-            out = new_df.copy()
-            out["proba"] = p
-            out["pred_class"] = pred
-        else:
-            pred = clf_pipe.predict(new_df)
-            out = new_df.copy()
-            out["pred_class"] = pred
-
-        st.write(out.head())
-        st.download_button("⬇️ Download classification inference (CSV)",
-                           out.to_csv(index=False).encode(),
-                           file_name="classification_inference.csv")
 
 # ---------------------- Regression Tab ----------------------
 with tabs[4]:
@@ -438,29 +403,139 @@ with tabs[4]:
                        out_df.to_csv(index=False).encode(),
                        file_name="profit_regression_preds.csv")
 
-    # ===================== PREDICTION ON NEW DATA (Regression) =====================
+# ---------------------- Manual Prediction Tab (NEW) ----------------------
+with tabs[5]:
+    st.header("📝 Manual Prediction (single row)")
+
+    df_ref = df.copy()
+
+    # Requested columns (normalized)
+    requested_cols = [
+        "segment", "city", "state", "country", "postal_code", "market", "region",
+        "product_id", "category", "sub_category", "product_name",
+        "sales", "quantity", "discount", "profit", "shipping_cost", "order_priority"
+    ]
+    available = [c for c in requested_cols if c in df_ref.columns]
+
+    # Build suggestions for categoricals (top-50)
+    cat_suggestions = {}
+    for c in df_ref.select_dtypes(include=["object", "category"]).columns:
+        cat_suggestions[c] = list(df_ref[c].dropna().astype(str).value_counts().head(50).index)
+
+    # Numeric defaults (median)
+    num_defaults = {}
+    for c in df_ref.select_dtypes(include=[np.number, "bool", "boolean"]).columns:
+        try:
+            num_defaults[c] = float(pd.to_numeric(df_ref[c], errors="coerce").median())
+        except Exception:
+            num_defaults[c] = 0.0
+
+    numeric_fields = [c for c in ["sales","quantity","discount","profit","shipping_cost"] if c in available]
+    categorical_fields = [c for c in available if c not in numeric_fields]
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.subheader("🔢 Numeric")
+        num_inputs = {}
+        for col in numeric_fields:
+            default = num_defaults.get(col, 0.0)
+            step = 0.01 if col == "discount" else 1.0
+            fmt = "%.6f" if step == 0.01 else "%.4f"
+            num_inputs[col] = st.number_input(col, value=float(default), step=step, format=fmt)
+
+    with c2:
+        st.subheader("🏷️ Categorical")
+        cat_inputs = {}
+        for col in categorical_fields:
+            opts = cat_suggestions.get(col, [])
+            if opts:
+                choice = st.selectbox(col, options=["(enter manually)"] + opts)
+                if choice == "(enter manually)":
+                    cat_inputs[col] = st.text_input(f"{col} (manual)", value="")
+                else:
+                    cat_inputs[col] = choice
+            else:
+                cat_inputs[col] = st.text_input(col, value="")
+
+    # Construct a single row
+    row = {}
+    for k, v in num_inputs.items(): row[k] = v
+    for k, v in cat_inputs.items(): row[k] = v if (v is not None and v != "") else None
+    one = pd.DataFrame([row])
+
+    # Make sure all dataset columns exist for feature computation
+    for m in set(df_ref.columns) - set(one.columns):
+        one[m] = np.nan
+
+    # Normalize + parse dates + features
+    one = _normalize_columns(one)
+    one = _auto_parse_dates(one)
+    one = add_features(one)
+
     st.markdown("---")
-    st.subheader("🧪 Predict on new data (Regression)")
-    upl_r = st.file_uploader("Upload CSV/XLSX for regression prediction", type=["csv","xlsx","xls"], key="upl_reg")
-    if upl_r is not None:
-        new_df_r = _load_new_table(upl_r)
-        new_df_r = _align_for_inference(new_df_r, num_cols_r, cat_cols_r)
+    st.subheader("Choose task(s) and predict")
 
-        preds = reg_pipe.predict(new_df_r)
-        out_r = new_df_r.copy()
-        out_r["y_pred_profit"] = preds
+    do_class = st.checkbox("🔎 Classification (profit > 0)", value=True)
+    do_reg   = st.checkbox("📈 Regression (predict profit value)", value=True)
 
-        if "profit" in out_r.columns:
-            y_true_r = pd.to_numeric(out_r["profit"], errors="coerce")
-            out_r["residual"] = y_true_r - preds
+    # ===== Classification =====
+    if do_class:
+        st.markdown("### 🔎 Classification Result")
+        X_clf = one.copy()
+        LEAK_LIKE = {"profit", "is_profitable", "profit_bucket", "gross_margin_pct", "profitability_category"}
+        leak_cols = [c for c in X_clf.columns if (c.lower() in LEAK_LIKE) or ("profit" in c.lower())]
+        X_clf = X_clf.drop(columns=leak_cols, errors="ignore")
+        for c in X_clf.columns:
+            if pd.api.types.is_datetime64_any_dtype(X_clf[c]):
+                X_clf[c] = pd.to_datetime(X_clf[c], errors="coerce").dt.to_period("M").astype(str)
 
-        st.write(out_r.head())
-        st.download_button("⬇️ Download regression inference (CSV)",
-                           out_r.to_csv(index=False).encode(),
-                           file_name="regression_inference.csv")
+        if "clf_pipe" in locals() and "num_cols" in locals() and "cat_cols" in locals():
+            pipe = clf_pipe; num_cols_ref, cat_cols_ref = num_cols, cat_cols
+        else:
+            y_tmp = (pd.to_numeric(df_ref["profit"], errors="coerce") > 0).astype(int)
+            X_tmp = df_ref.copy()
+            X_tmp = X_tmp.drop(columns=leak_cols, errors="ignore")
+            pipe, num_cols_ref, cat_cols_ref = _build_quick_clf_pipeline(X_tmp, y_tmp, random_state=random_state)
+
+        needed = list(set(num_cols_ref) | set(cat_cols_ref))
+        for col in set(needed) - set(X_clf.columns): X_clf[col] = np.nan
+        X_align = X_clf[needed]
+
+        if hasattr(pipe, "predict_proba"):
+            proba = float(pipe.predict_proba(X_align)[:, 1][0])
+            pred  = int(proba >= 0.5)
+            st.write({"pred_class": pred, "proba": proba})
+        else:
+            pred = int(pipe.predict(X_align)[0])
+            st.write({"pred_class": pred})
+
+    # ===== Regression =====
+    if do_reg:
+        st.markdown("### 📈 Regression Result")
+        X_reg = one.drop(columns=["profit"], errors="ignore").copy()
+        for c in X_reg.columns:
+            if pd.api.types.is_datetime64_any_dtype(X_reg[c]):
+                X_reg[c] = pd.to_datetime(X_reg[c], errors="coerce").dt.to_period("M").astype(str)
+
+        if "reg_pipe" in locals() and "num_cols_r" in locals() and "cat_cols_r" in locals():
+            rpipe = reg_pipe; num_cols_ref_r, cat_cols_ref_r = num_cols_r, cat_cols_r
+        else:
+            y_tmp = pd.to_numeric(df_ref["profit"], errors="coerce")
+            X_tmp = df_ref.drop(columns=["profit"], errors="ignore").copy()
+            rpipe, num_cols_ref_r, cat_cols_ref_r = _build_quick_reg_pipeline(X_tmp, y_tmp, random_state=random_state)
+
+        needed_r = list(set(num_cols_ref_r) | set(cat_cols_ref_r))
+        for col in set(needed_r) - set(X_reg.columns): X_reg[col] = np.nan
+        X_align_r = X_reg[needed_r]
+
+        y_pred_one = float(rpipe.predict(X_align_r)[0])
+        st.write({"y_pred_profit": y_pred_one})
+
+    st.info("✳️ Manual tab uses the same preprocessing and features. If you open the model tabs first, it will reuse those trained pipelines.")
 
 # ---------------------- Export Tab ----------------------
-with tabs[5]:
+with tabs[6]:
     st.header("📤 Export & Save")
     st.write("Download the enriched dataset (with engineered features):")
     st.download_button(
@@ -478,6 +553,7 @@ with tabs[5]:
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("unitprice_band not available — it appears when `sales` and `quantity` exist.")
+
 
 
 

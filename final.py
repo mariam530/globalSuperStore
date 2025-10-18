@@ -1,10 +1,9 @@
 # app.py
 # ============================================================
 # Streamlit: Full Analysis + Profit Modeling (Classification & Regression)
+# + Inference on new CSV/XLSX files
 # ============================================================
 import io
-import os
-from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -37,153 +36,85 @@ with st.sidebar:
     random_state = st.number_input("Random State", min_value=0, value=42, step=1)
     downsample = st.checkbox("Speed mode: downsample to 20k rows if larger", value=True)
     st.markdown("---")
-    st.caption("Demo data loads automatically. No upload needed.")
-    st.markdown("---")
-    show_all = st.checkbox("🧾 Show everything on one page", value=False)
-    show_diag = st.checkbox("🔧 Show diagnostics (columns & dtypes)", value=True)
+    st.caption("Using local CSV: Global_Superstore2.csv (latin1). Dates will be auto-parsed when possible.")
 
-# ---------------------- Load & Clean (Demo Mode only) ----------------------
-@st.cache_data(show_spinner=False)
-def load_df_v2(path_or_file=None, url=None) -> pd.DataFrame:
-    """
-    Robust CSV loader:
-    - If 'path_or_file' is a path (str/Path), read bytes from disk.
-    - If it's a file-like (UploadedFile/BytesIO), read raw bytes.
-    - Else, if 'url' is provided, read from URL.
-    - Tries multiple encodings + delimiter inference (sep=None, engine='python').
-    - Normalizes column names & parses date-like columns.
-    """
-    raw = None
+# ---------------------- Helpers ----------------------
+def _ohe_sparse():
+    try:
+        return OneHotEncoder(handle_unknown="ignore", sparse_output=True, dtype=np.float32)
+    except TypeError:
+        return OneHotEncoder(handle_unknown="ignore", sparse=True, dtype=np.float32)
 
-    # 1) Resolve source to raw bytes
-    if path_or_file is not None:
-        # Path on disk
-        if isinstance(path_or_file, (str, Path)):
-            p = Path(path_or_file)
-            with p.open("rb") as f:
-                raw = f.read()
-        # File-like
-        elif hasattr(path_or_file, "read"):
-            raw = path_or_file.read()
-            if hasattr(path_or_file, "seek"):
-                path_or_file.seek(0)
-        else:
-            raise ValueError("Unsupported path_or_file type.")
-    elif url:
-        # pandas will fetch URL internally; I'll decode with fallback encodings below
-        for enc in ["Windows-1252", "utf-8", "latin1", "ISO-8859-1", "cp1256"]:
-            try:
-                df_try = pd.read_csv(url, encoding=enc, sep=None, engine="python")
-                df = df_try
-                used_enc, used_sep = enc, "inferred"
-                break
-            except Exception:
-                df = None
-        if df is None:
-            st.error("❌ Failed to read CSV from URL. Check DATA_URL.")
-            st.stop()
-        # normalize names & parse dates
-        df.columns = (df.columns.str.strip()
-                      .str.replace(r"[()\s]+", "_", regex=True)
-                      .str.lower())
-        for c in df.columns:
-            if any(k in c for k in ["date", "order", "ship"]):
-                try:
-                    df[c] = pd.to_datetime(df[c], errors="ignore")
-                except Exception:
-                    pass
-        st.caption(f"Loaded from URL | Encoding: {used_enc} | Separator: {used_sep} | Shape: {df.shape[0]:,} x {df.shape[1]}")
-        return df
-    else:
-        st.error("No demo data source specified.")
-        st.stop()
-
-    # 2) Try encodings + delimiter inference on raw bytes
-    encodings = ["Windows-1252", "utf-8", "latin1", "ISO-8859-1", "cp1256"]
-    last_err = None
-    df = None
-    used_enc, used_sep = None, None
-
-    # (A) delimiter inference
-    for enc in encodings:
-        try:
-            buf = io.BytesIO(raw)
-            df_try = pd.read_csv(buf, encoding=enc, sep=None, engine="python")
-            if df_try.shape[1] > 1:
-                df = df_try; used_enc, used_sep = enc, "inferred"
-                break
-        except Exception as e:
-            last_err = e
-            df = None
-
-    # (B) explicit separators
-    if df is None:
-        for enc in encodings:
-            for sep in [",", ";", "\t", "|"]:
-                try:
-                    buf = io.BytesIO(raw)
-                    df_try = pd.read_csv(buf, encoding=enc, sep=sep)
-                    if df_try.shape[1] > 1:
-                        df = df_try; used_enc, used_sep = enc, sep
-                        break
-                except Exception as e:
-                    last_err = e
-                    df = None
-            if df is not None:
-                break
-
-    if df is None:
-        st.error("❌ Failed to read CSV properly. Try saving as UTF-8 (comma-separated).")
-        if last_err:
-            st.caption(f"Last error: {type(last_err).__name__}: {last_err}")
-        st.stop()
-
-    # normalize column names
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
     df.columns = (
-        df.columns
+        df.columns.astype(str)
           .str.strip()
-          .str.replace(r"[()\s]+", "_", regex=True)
+          .str.replace(r"[()\[\]\s]+", "_", regex=True)
+          .str.replace(r"__+", "_", regex=True)
+          .str.strip("_")
           .str.lower()
     )
-
-    # parse common date columns if present
-    for c in df.columns:
-        if any(k in c for k in ["date", "order", "ship"]):
-            try:
-                df[c] = pd.to_datetime(df[c], errors="ignore")
-            except Exception:
-                pass
-
-    st.caption(f"Decoded with: {used_enc} | Separator: {used_sep} | Shape: {df.shape[0]:,} x {df.shape[1]}")
     return df
 
-# DEMO data source (no uploader)
-DEFAULT_DATA_PATH = Path(__file__).parent / "Global_Superstore2.csv"
-DATA_URL = st.secrets.get("DATA_URL", None) if hasattr(st, "secrets") else None
-if DATA_URL is None:
-    DATA_URL = os.getenv("DATA_URL", None)
+def _auto_parse_dates(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    date_like_cols = [c for c in df.columns if any(k in c for k in ["date", "order", "ship", "invoice", "time"])]
+    for c in date_like_cols:
+        try:
+            if not pd.api.types.is_datetime64_any_dtype(df[c]):
+                df[c] = pd.to_datetime(df[c], errors="coerce", infer_datetime_format=True)
+        except Exception:
+            pass
+    return df
 
-if DEFAULT_DATA_PATH.exists():
-    df = load_df_v2(DEFAULT_DATA_PATH, url=None)
-    st.caption(f"Loaded demo data from: {DEFAULT_DATA_PATH}")
-elif DATA_URL:
-    df = load_df_v2(path_or_file=None, url=DATA_URL)
-    st.caption("Loaded demo data from external URL (DATA_URL).")
-else:
-    st.error("⚠️ Demo data not found.\n• أضف ملفك إلى: data/Global_Superstore2.csv\n• أو ضعي رابط CSV في Secrets/Env باسم DATA_URL")
-    st.stop()
+def _load_new_table(file) -> pd.DataFrame:
+    """Load CSV/Excel for inference (uploader)."""
+    name = file.name.lower()
+    if name.endswith((".xlsx", ".xls")):
+        df_new = pd.read_excel(file, engine=None)
+        return _auto_parse_dates(_normalize_columns(df_new))
+    raw = file.read()
+    for enc in ["utf-8","utf-8-sig","latin1","iso-8859-1","windows-1256"]:
+        for sep in [None, ",",";","\t","|"]:
+            try:
+                bio = io.BytesIO(raw)
+                df_new = pd.read_csv(bio, encoding=enc, sep=sep, engine="python")
+                return _auto_parse_dates(_normalize_columns(df_new))
+            except Exception:
+                continue
+    bio = io.BytesIO(raw)
+    df_new = pd.read_csv(bio, engine="python")
+    return _auto_parse_dates(_normalize_columns(df_new))
 
-# ---------------------- Diagnostics ----------------------
+def _align_for_inference(df_new: pd.DataFrame, num_cols_ref, cat_cols_ref) -> pd.DataFrame:
+    """Match new-data columns to training schema; convert datetimes to 'M' strings."""
+    df_new = df_new.copy()
+    for c in df_new.columns:
+        if pd.api.types.is_datetime64_any_dtype(df_new[c]):
+            df_new[c] = pd.to_datetime(df_new[c], errors="coerce").dt.to_period("M").astype(str)
+    needed = set(num_cols_ref) | set(cat_cols_ref)
+    for c in needed - set(df_new.columns):
+        df_new[c] = np.nan
+    return df_new
+
+# ---------------------- Load & Clean (direct file) ----------------------
+df = pd.read_csv("Global_Superstore2.csv", encoding="latin1")
+df = _normalize_columns(df)
+df = _auto_parse_dates(df)
+
 st.subheader("📄 Data Preview")
 st.write(df.head())
 st.write(f"Rows: {len(df):,} | Columns: {len(df.columns)}")
 
-if show_diag:
-    with st.expander("🔧 Diagnostics: columns & dtypes", expanded=True):
-        st.write("**Columns:**", list(df.columns))
-        dtypes_df = pd.DataFrame({"column": df.columns, "dtype": df.dtypes.astype(str).values})
-        st.write(dtypes_df)
-        st.dataframe(df.head(20), use_container_width=True)
+# Ensure profit column
+if "profit" not in df.columns:
+    cand = [c for c in df.columns if c.lower() == "profit"]
+    if cand:
+        df = df.rename(columns={cand[0]: "profit"})
+    else:
+        st.error("Column 'profit' not found. Please ensure your dataset has a 'profit' column.")
+        st.stop()
 
 # Optional downsample
 if downsample and len(df) > 20_000:
@@ -193,18 +124,15 @@ if downsample and len(df) > 20_000:
 # ---------------------- Feature Engineering ----------------------
 def add_features(X: pd.DataFrame) -> pd.DataFrame:
     X = X.copy()
-
     # Unit price & gross margin
     if {"sales", "quantity"}.issubset(X.columns):
-        X["unit_price"] = np.where(pd.to_numeric(X["quantity"], errors="coerce") > 0,
-                                   pd.to_numeric(X.get("sales"), errors="coerce") /
-                                   pd.to_numeric(X.get("quantity"), errors="coerce"),
-                                   np.nan)
+        qty = pd.to_numeric(X["quantity"], errors="coerce")
+        sales = pd.to_numeric(X["sales"], errors="coerce")
+        X["unit_price"] = np.where(qty > 0, sales / qty, np.nan)
     if {"profit", "sales"}.issubset(X.columns):
         sales = pd.to_numeric(X["sales"], errors="coerce")
         profit = pd.to_numeric(X["profit"], errors="coerce")
         X["gross_margin_pct"] = np.where(sales != 0, profit / sales, np.nan)
-
     # Discount cleanup
     if "discount" in X.columns:
         X["discount_pct"] = pd.to_numeric(X["discount"], errors="coerce").clip(lower=0, upper=1)
@@ -213,17 +141,13 @@ def add_features(X: pd.DataFrame) -> pd.DataFrame:
             bins=[-0.001, 0.0, 0.10, 0.20, 0.30, 1.0],
             labels=["0%", "0-10%", "10-20%", "20-30%", "30%+"]
         )
-
     # Profitable flag
-    if "profit" in X.columns:
-        X["is_profitable"] = (pd.to_numeric(X["profit"], errors="coerce") > 0).astype(int)
-
+    X["is_profitable"] = (pd.to_numeric(X["profit"], errors="coerce") > 0).astype(int)
     # Ship delay
     if "order_date" in X.columns and "ship_date" in X.columns:
         if pd.api.types.is_datetime64_any_dtype(X["order_date"]) and pd.api.types.is_datetime64_any_dtype(X["ship_date"]):
             X["ship_delay_days"] = (X["ship_date"] - X["order_date"]).dt.days
-
-    # Date parts from order_date
+    # Date parts
     if "order_date" in X.columns and pd.api.types.is_datetime64_any_dtype(X["order_date"]):
         od = X["order_date"]
         X["order_year"] = od.dt.year
@@ -233,15 +157,17 @@ def add_features(X: pd.DataFrame) -> pd.DataFrame:
         X["order_weekday"] = od.dt.day_name()
         X["order_dow"] = od.dt.dayofweek
         X["order_weekend"] = X["order_dow"].isin([5, 6]).astype(int)
-
     # Unit price bands
     if "unit_price" in X.columns:
         q = X["unit_price"].quantile([0.25, 0.5, 0.75])
-        X["unitprice_band"] = pd.cut(
-            X["unit_price"],
-            bins=[-np.inf, q.iloc[0], q.iloc[1], q.iloc[2], np.inf],
-            labels=["Low", "Mid", "High", "Premium"]
-        )
+        try:
+            X["unitprice_band"] = pd.cut(
+                X["unit_price"],
+                bins=[-np.inf, q.iloc[0], q.iloc[1], q.iloc[2], np.inf],
+                labels=["Low", "Mid", "High", "Premium"]
+            )
+        except Exception:
+            pass
     return X
 
 df = add_features(df)
@@ -259,112 +185,74 @@ with tabs[0]:
     c1, c2 = st.columns(2)
     with c1:
         st.write("**Numeric Summary**")
-        st.write(df.select_dtypes(include=np.number).describe().T)
+        num_desc = df.select_dtypes(include=[np.number, "boolean", "bool"]).describe().T
+        st.write(num_desc if not num_desc.empty else "No numeric columns.")
     with c2:
         st.write("**Missing Values**")
         miss = df.isna().sum().sort_values(ascending=False)
-        st.write(miss[miss > 0].to_frame("missing_count"))
+        st.write(miss[miss > 0].to_frame("missing_count") if (miss > 0).any() else "No missing values detected.")
 
 # ---------------------- Analysis Tab ----------------------
 with tabs[1]:
-    st.subheader("Analysis Questions")
-    u_tab, b_tab, m_tab = st.tabs(["Univariate", "Bivariate", "Multivariate"])
+    st.subheader("Common Analysis Questions")
 
-    # ---------- Helpers ----------
-    num_cols_all = df.select_dtypes(include=np.number).columns.tolist()
-    cat_cols_all = df.select_dtypes(exclude=[np.number, "bool", "boolean"]).columns.tolist()
-
-    # ---------- Univariate ----------
-    with u_tab:
-        st.markdown("### 📌 Univariate")
+    st.markdown("**1) Top/Bottom by profit**")
+    top_n = st.slider("N (top/bottom)", 3, 50, 10, 1, key="n_top")
+    groupable_cols = [c for c in df.columns if df[c].dtype == object or df[c].dtype.name == "category"]
+    by_col = st.selectbox("Group by", options=groupable_cols + ["(no group)"])
+    if by_col != "(no group)":
+        g = df.groupby(by_col, dropna=False)["profit"].sum().sort_values(ascending=False)
         c1, c2 = st.columns(2)
         with c1:
-            if num_cols_all:
-                ux = st.selectbox("Numeric column (histogram)", options=num_cols_all, index=0, key="uni_num")
-                st.plotly_chart(px.histogram(df, x=ux, nbins=50, title=f"Distribution of {ux}"), use_container_width=True)
-            else:
-                st.info("No numeric columns detected.")
+            st.write("**Top**")
+            st.write(g.head(top_n).to_frame("sum_profit"))
         with c2:
-            if cat_cols_all:
-                uc = st.selectbox("Categorical column (counts)", options=cat_cols_all, index=0, key="uni_cat")
-                vc = (df[uc].value_counts(dropna=False).rename_axis(uc).reset_index(name="count"))
-                vc = vc[vc[uc].notna()]
-                st.plotly_chart(px.bar(vc, x=uc, y="count", title=f"Counts by {uc}"), use_container_width=True)
-            else:
-                st.info("No categorical columns detected.")
-
-        st.markdown("---")
-        if "order_yearmonth" in df.columns:
-            metric = st.selectbox("Time-series metric", options=[c for c in ["profit", "sales", "quantity"] if c in df.columns], index=0, key="uni_ts")
-            ts = df.groupby("order_yearmonth")[metric].sum().reset_index()
-            st.plotly_chart(px.line(ts, x="order_yearmonth", y=metric, title=f"{metric} over time (monthly)"), use_container_width=True)
-
-    # ---------- Bivariate ----------
-    with b_tab:
-        st.markdown("### 🔗 Bivariate")
-        # Profit by category
-        if "profit" in df.columns and cat_cols_all:
-            cat_sel = st.selectbox("Group by (bar of sum profit)", options=cat_cols_all, key="bi_cat")
-            g = df.groupby(cat_sel, dropna=False)["profit"].sum().sort_values(ascending=False).reset_index()
-            g = g[g[cat_sel].notna()]
-            st.plotly_chart(px.bar(g, x=cat_sel, y="profit", title=f"Total Profit by {cat_sel}"), use_container_width=True)
-        # Box plot: profit by category
-        if "profit" in df.columns and cat_cols_all:
-            cat_box = st.selectbox("Profit distribution by (box)", options=cat_cols_all, key="bi_box")
-            st.plotly_chart(px.box(df, x=cat_box, y="profit", points=False, title=f"Profit distribution by {cat_box}"), use_container_width=True)
-        # Scatter: unit_price vs profit (or sales)
-        xnum = None
-        for candidate in ["unit_price", "sales", "quantity"]:
-            if candidate in df.columns:
-                xnum = candidate; break
-        if xnum and "profit" in df.columns:
-            color_opt = st.selectbox("Color by (optional)", options=[None] + cat_cols_all, key="bi_color")
-            st.plotly_chart(px.scatter(df, x=xnum, y="profit", color=color_opt, title=f"{xnum} vs Profit"), use_container_width=True)
-        # Correlation heatmap
-        if len(num_cols_all) >= 2:
-            corr = df[num_cols_all].corr(numeric_only=True)
-            st.plotly_chart(px.imshow(corr, title="Correlation (numeric)", aspect="auto"), use_container_width=True)
-
-    # ---------- Multivariate ----------
-    with m_tab:
-        st.markdown("### 🧩 Multivariate")
-        # Scatter with color & size
-        nx = None
-        for c in ["sales", "unit_price", "quantity"]:
-            if c in df.columns:
-                nx = c; break
-        ny = "profit" if "profit" in df.columns else (num_cols_all[0] if num_cols_all else None)
-        if nx and ny:
-            size_col = "quantity" if ("quantity" in df.columns and ny != "quantity") else None
-            color_by = st.selectbox("Color by", options=[None] + cat_cols_all, key="mv_color")
-            st.plotly_chart(px.scatter(df, x=nx, y=ny, color=color_by, size=size_col, title=f"{nx} vs {ny} (colored)"), use_container_width=True)
-        # Facet grid (category vs time)
-        
-if "order_yearmonth" in df.columns and "profit" in df.columns and cat_cols_all:
-    cat_f = st.selectbox("Facet by", options=cat_cols_all, key="mv_facet")
-    ts2 = df.groupby(["order_yearmonth", cat_f])["profit"].sum().reset_index()
-
-    # Avoid Plotly vertical spacing error by capping facets and setting spacing to 0
-    max_facets = st.slider("Max facets (to avoid overcrowding)", 3, 24, 12, 1, key="mv_maxfacets")
-    top_cats = (df.groupby(cat_f)["profit"].sum()
-                  .sort_values(ascending=False).head(max_facets).index)
-    ts2f = ts2[ts2[cat_f].isin(top_cats)]
-    nfacets = ts2f[cat_f].nunique()
-
-    if nfacets <= 1:
-        fig = px.line(ts2f, x="order_yearmonth", y="profit",
-                      title=f"Monthly Profit by {cat_f}")
+            st.write("**Bottom**")
+            st.write(g.tail(top_n).to_frame("sum_profit"))
     else:
-        fig = px.line(ts2f, x="order_yearmonth", y="profit",
-                      facet_col=cat_f, facet_col_wrap=3,
-                      facet_row_spacing=0.0, facet_col_spacing=0.02,
-                      title=f"Monthly Profit by {cat_f} (top {nfacets})")
-    st.plotly_chart(fig, use_container_width=True)
+        st.info("Choose a categorical column to aggregate by.")
 
-        # Scatter matrix for top numeric subset
-    if len(num_cols_all) >= 3:
-            few = num_cols_all[:5]
-            st.plotly_chart(px.scatter_matrix(df, dimensions=few, title="Scatter Matrix (top numeric)"), use_container_width=True)
+    st.markdown("---")
+    st.markdown("**2) Average metrics by segment/category**")
+    group_cols = st.multiselect("Select grouping columns", options=df.columns.tolist(),
+                                default=[c for c in ["segment", "category"] if c in df.columns])
+    metrics = st.multiselect(
+        "Select metrics",
+        options=[c for c in ["profit", "sales", "quantity", "shipping_cost", "discount_pct", "unit_price"] if c in df.columns],
+        default=[c for c in ["profit", "sales"] if c in df.columns]
+    )
+    if group_cols and metrics:
+        agg_df = df.groupby(group_cols, dropna=False)[metrics].mean().reset_index()
+        st.write(agg_df)
+
+    st.markdown("---")
+    st.markdown("**3) Correlation (numeric)**")
+    numdf = df.select_dtypes(include=[np.number, "boolean", "bool"])
+    if not numdf.empty:
+        corr = numdf.corr(numeric_only=True)
+        fig = px.imshow(corr, title="Correlation Heatmap", aspect="auto")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No numeric columns to show correlations.")
+
+    st.markdown("---")
+    st.markdown("**4) Time series (if order_date available)**")
+    if "order_yearmonth" in df.columns:
+        ts_metric = st.selectbox("Metric", options=[c for c in ["profit", "sales", "quantity"] if c in df.columns], index=0)
+        ts = df.groupby("order_yearmonth")[ts_metric].sum().reset_index()
+        fig = px.line(ts, x="order_yearmonth", y=ts_metric, title=f"{ts_metric} over time (monthly)")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("order_date/order_yearmonth not available.")
+
+    st.markdown("---")
+    st.markdown("**5) Shipping delay vs profit (if available)**")
+    if {"ship_delay_days", "profit"}.issubset(df.columns):
+        color_col = "segment" if "segment" in df.columns else None
+        fig = px.scatter(df, x="ship_delay_days", y="profit", color=color_col, title="Shipping delay vs Profit")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("ship_delay_days not available to plot.")
 
 # ---------------------- Visualizations Tab ----------------------
 with tabs[2]:
@@ -401,30 +289,25 @@ with tabs[3]:
     leak_cols = [c for c in X.columns if (c.lower() in LEAK_LIKE) or ("profit" in c.lower())]
     X = X.drop(columns=leak_cols, errors="ignore")
 
-    # Datetime → monthly bins
+    # Datetime → monthly bins (strings)
     for c in X.columns:
         if pd.api.types.is_datetime64_any_dtype(X[c]):
-            X[c] = pd.to_datetime(X[c], errors="coerce")
-            X[c] = X[c].dt.to_period("M").astype(str)
+            X[c] = pd.to_datetime(X[c], errors="coerce").dt.to_period("M").astype(str)
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=random_state, stratify=y
     )
 
-    # Preprocess
-    def OHE():
-        try:
-            return OneHotEncoder(handle_unknown="ignore", sparse_output=True, dtype=np.float32)
-        except TypeError:
-            return OneHotEncoder(handle_unknown="ignore", sparse=True, dtype=np.float32)
-
     num_cols = X_train.select_dtypes(include=[np.number, "bool", "boolean"]).columns.tolist()
     cat_cols = X_train.select_dtypes(exclude=[np.number, "bool", "boolean"]).columns.tolist()
 
     preprocess = ColumnTransformer(
-        [("num", Pipeline([("imp", SimpleImputer(strategy="median")), ("scale", MaxAbsScaler())]), num_cols),
-         ("cat", Pipeline([("imp", SimpleImputer(strategy="most_frequent")), ("ohe", OHE())]), cat_cols)],
-        remainder="drop", sparse_threshold=1.0
+        [
+            ("num", Pipeline([("imp", SimpleImputer(strategy="median")), ("scale", MaxAbsScaler())]), num_cols),
+            ("cat", Pipeline([("imp", SimpleImputer(strategy="most_frequent")), ("ohe", _ohe_sparse())]), cat_cols),
+        ],
+        remainder="drop",
+        sparse_threshold=1.0
     )
 
     model_name = st.selectbox("Model", ["LogisticRegression", "RandomForest", "GradientBoosting"])
@@ -450,29 +333,55 @@ with tabs[3]:
     c2.metric("Recall", f"{rec:.3f}")
     c3.metric("F1", f"{f1:.3f}")
 
-    cm = confusion_matrix(y_test, y_pred, labels=[0,1])
+    cm = confusion_matrix(y_test, y_pred, labels=[0, 1])
     st.subheader("Confusion Matrix")
     st.write(pd.DataFrame(cm,
                           index=pd.Index(["True 0","True 1"], name="Actual"),
                           columns=pd.Index(["Pred 0","Pred 1"], name="Predicted")))
 
     # Threshold tuning
+    thr = 0.5
     if hasattr(clf_pipe, "predict_proba"):
         st.subheader("🎚️ Threshold Tuning (maximize F1)")
         thr = st.slider("Threshold", 0.0, 1.0, 0.5, 0.01)
         proba = clf_pipe.predict_proba(X_test)[:, 1]
         y_thr = (proba >= thr).astype(int)
-        prec_b = precision_score(y_test, y_thr, zero_division=0)
-        rec_b  = recall_score(y_test, y_thr, zero_division=0)
-        f1_b   = f1_score(y_test, y_thr, zero_division=0)
         d1, d2, d3 = st.columns(3)
-        d1.metric("Precision (thr)", f"{prec_b:.3f}")
-        d2.metric("Recall (thr)", f"{rec_b:.3f}")
-        d3.metric("F1 (thr)", f"{f1_b:.3f}")
+        d1.metric("Precision (thr)", f"{precision_score(y_test, y_thr, zero_division=0):.3f}")
+        d2.metric("Recall (thr)", f"{recall_score(y_test, y_thr, zero_division=0):.3f}")
+        d3.metric("F1 (thr)", f"{f1_score(y_test, y_thr, zero_division=0):.3f}")
 
         out_df = pd.DataFrame({"y_true": y_test, "proba": proba, "y_pred_thr": y_thr})
-        st.download_button("⬇️ Download classification predictions (CSV)", out_df.to_csv(index=False).encode(),
+        st.download_button("⬇️ Download classification predictions (CSV)",
+                           out_df.to_csv(index=False).encode(),
                            file_name="profit_classification_preds.csv")
+
+    # ===================== PREDICTION ON NEW DATA (Classification) =====================
+    st.markdown("---")
+    st.subheader("🧪 Predict on new data (Classification)")
+    upl_c = st.file_uploader("Upload CSV/XLSX for classification prediction", type=["csv","xlsx","xls"], key="upl_clf")
+    if upl_c is not None:
+        new_df = _load_new_table(upl_c)
+        new_df = _align_for_inference(new_df, num_cols, cat_cols)
+        # Drop leakage columns if present
+        new_df = new_df.drop(columns=[c for c in new_df.columns if (c.lower() in LEAK_LIKE) or ("profit" in c.lower())], errors="ignore")
+
+        if hasattr(clf_pipe, "predict_proba"):
+            thr_used = thr  # use slider value
+            p = clf_pipe.predict_proba(new_df)[:, 1]
+            pred = (p >= thr_used).astype(int)
+            out = new_df.copy()
+            out["proba"] = p
+            out["pred_class"] = pred
+        else:
+            pred = clf_pipe.predict(new_df)
+            out = new_df.copy()
+            out["pred_class"] = pred
+
+        st.write(out.head())
+        st.download_button("⬇️ Download classification inference (CSV)",
+                           out.to_csv(index=False).encode(),
+                           file_name="classification_inference.csv")
 
 # ---------------------- Regression Tab ----------------------
 with tabs[4]:
@@ -483,27 +392,22 @@ with tabs[4]:
     # Datetime → monthly bins
     for c in X.columns:
         if pd.api.types.is_datetime64_any_dtype(X[c]):
-            X[c] = pd.to_datetime(X[c], errors="coerce")
-            X[c] = X[c].dt.to_period("M").astype(str)
+            X[c] = pd.to_datetime(X[c], errors="coerce").dt.to_period("M").astype(str)
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=random_state
     )
 
-    # Preprocess
-    def OHE2():
-        try:
-            return OneHotEncoder(handle_unknown="ignore", sparse_output=True, dtype=np.float32)
-        except TypeError:
-            return OneHotEncoder(handle_unknown="ignore", sparse=True, dtype=np.float32)
+    num_cols_r = X_train.select_dtypes(include=[np.number, "bool", "boolean"]).columns.tolist()
+    cat_cols_r = X_train.select_dtypes(exclude=[np.number, "bool", "boolean"]).columns.tolist()
 
-    num_cols = X_train.select_dtypes(include=[np.number, "bool", "boolean"]).columns.tolist()
-    cat_cols = X_train.select_dtypes(exclude=[np.number, "bool", "boolean"]).columns.tolist()
-
-    preprocess = ColumnTransformer(
-        [("num", Pipeline([("imp", SimpleImputer(strategy="median")), ("scale", MaxAbsScaler())]), num_cols),
-         ("cat", Pipeline([("imp", SimpleImputer(strategy="most_frequent")), ("ohe", OHE2())]), cat_cols)],
-        remainder="drop", sparse_threshold=1.0
+    preprocess_r = ColumnTransformer(
+        [
+            ("num", Pipeline([("imp", SimpleImputer(strategy="median")), ("scale", MaxAbsScaler())]), num_cols_r),
+            ("cat", Pipeline([("imp", SimpleImputer(strategy="most_frequent")), ("ohe", _ohe_sparse())]), cat_cols_r),
+        ],
+        remainder="drop",
+        sparse_threshold=1.0
     )
 
     model_name = st.selectbox("Model", ["LinearRegression", "RandomForestRegressor", "GradientBoostingRegressor"])
@@ -514,7 +418,7 @@ with tabs[4]:
     else:
         model = GradientBoostingRegressor(random_state=random_state)
 
-    reg_pipe = Pipeline([("prep", preprocess), ("reg", model)])
+    reg_pipe = Pipeline([("prep", preprocess_r), ("reg", model)])
     with st.spinner("Training regressor..."):
         reg_pipe.fit(X_train, y_train)
 
@@ -525,19 +429,45 @@ with tabs[4]:
         rmse = np.sqrt(mean_squared_error(y_test, y_pred))
 
     r1, r2, r3 = st.columns(3)
-    r1.metric("R²", f"{r2_score(y_test, y_pred):.3f}")  
+    r1.metric("R²", f"{r2_score(y_test, y_pred):.3f}")
     r2.metric("MAE", f"{mean_absolute_error(y_test, y_pred):.3f}")
     r3.metric("RMSE", f"{rmse:.3f}")
 
     out_df = pd.DataFrame({"y_true": y_test, "y_pred": y_pred, "residual": y_test - y_pred})
-    st.download_button("⬇️ Download regression predictions (CSV)", out_df.to_csv(index=False).encode(),
+    st.download_button("⬇️ Download regression predictions (CSV)",
+                       out_df.to_csv(index=False).encode(),
                        file_name="profit_regression_preds.csv")
+
+    # ===================== PREDICTION ON NEW DATA (Regression) =====================
+    st.markdown("---")
+    st.subheader("🧪 Predict on new data (Regression)")
+    upl_r = st.file_uploader("Upload CSV/XLSX for regression prediction", type=["csv","xlsx","xls"], key="upl_reg")
+    if upl_r is not None:
+        new_df_r = _load_new_table(upl_r)
+        new_df_r = _align_for_inference(new_df_r, num_cols_r, cat_cols_r)
+
+        preds = reg_pipe.predict(new_df_r)
+        out_r = new_df_r.copy()
+        out_r["y_pred_profit"] = preds
+
+        if "profit" in out_r.columns:
+            y_true_r = pd.to_numeric(out_r["profit"], errors="coerce")
+            out_r["residual"] = y_true_r - preds
+
+        st.write(out_r.head())
+        st.download_button("⬇️ Download regression inference (CSV)",
+                           out_r.to_csv(index=False).encode(),
+                           file_name="regression_inference.csv")
 
 # ---------------------- Export Tab ----------------------
 with tabs[5]:
     st.header("📤 Export & Save")
     st.write("Download the enriched dataset (with engineered features):")
-    st.download_button("⬇️ Download enriched CSV", df.to_csv(index=False).encode(), file_name="enriched_dataset.csv")
+    st.download_button(
+        "⬇️ Download enriched CSV",
+        df.to_csv(index=False).encode(),
+        file_name="enriched_dataset.csv"
+    )
 
     st.markdown("**Quick Chart — Unit Price Band (if available)**")
     if "unitprice_band" in df.columns:
@@ -549,38 +479,5 @@ with tabs[5]:
     else:
         st.info("unitprice_band not available — it appears when `sales` and `quantity` exist.")
 
-# ---------------------- One-Page (optional) ----------------------
-if show_all:
-    st.markdown("---")
-    st.header("🧾 Full Page View")
-
-    # 1) Correlation 
-    _num = df.select_dtypes(include=np.number)
-    if not _num.empty:
-        try:
-            _corr = _num.corr(numeric_only=True)
-            _fig = px.imshow(_corr, title="Correlation Heatmap", aspect="auto")
-            st.plotly_chart(_fig, use_container_width=True)
-        except Exception:
-            pass
-
-    # 2) Time series 
-    if "order_yearmonth" in df.columns:
-        _metric = "profit" if "profit" in df.columns else (_num.columns[0] if not _num.empty else None)
-        if _metric:
-            _ts = df.groupby("order_yearmonth")[_metric].sum().reset_index()
-            st.plotly_chart(px.line(_ts, x="order_yearmonth", y=_metric, title=f"{_metric} over time"), use_container_width=True)
-
-    # 3) Profit histogram
-    if "profit" in df.columns:
-        st.plotly_chart(px.histogram(df, x="profit", title="Histogram: profit"), use_container_width=True)
-
-    # 4) Counts for first categorical column 
-    _cats = df.select_dtypes(exclude=[np.number, "bool", "boolean"]).columns.tolist()
-    if _cats:
-        _cx = _cats[0]
-        _vc = (df[_cx].value_counts(dropna=False).rename_axis(_cx).reset_index(name="count"))
-        _vc = _vc[_vc[_cx].notna()]
-        st.plotly_chart(px.bar(_vc, x=_cx, y="count", title=f"Counts by {_cx}"), use_container_width=True)
 
 

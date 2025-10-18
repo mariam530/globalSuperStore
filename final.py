@@ -309,7 +309,7 @@ with tabs[1]:
             st.write(g.head(50))
             fig = px.bar(g.head(50), x=col_x, y=col_y,
                          color=color_opt if color_opt in g.columns else None,
-                         title=f"{agg_func.upper()}({col_y}) by {col_x}")
+                         title=f"{agg_func.UPPER()}({col_y}) by {col_x}")
             st.plotly_chart(fig, use_container_width=True)
         elif pd.api.types.is_numeric_dtype(df[col_x]) and (not pd.api.types.is_numeric_dtype(df[col_y])):
             agg_func = st.selectbox("Aggregation", ["sum", "mean", "median", "count"], index=1, key="bi_agg_swap")
@@ -317,7 +317,7 @@ with tabs[1]:
             st.write(g.head(50))
             fig = px.bar(g.head(50), x=col_y, y=col_x,
                          color=color_opt if color_opt in g.columns else None,
-                         title=f"{agg_func.upper()}({col_x}) by {col_y}")
+                         title=f"{agg_func.UPPER()}({col_x}) by {col_y}")
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Both selected columns are categorical — showing count table.")
@@ -423,8 +423,10 @@ with tabs[3]:
         if pd.api.types.is_datetime64_any_dtype(X[c]):
             X[c] = pd.to_datetime(X[c], errors="coerce").dt.to_period("M").astype(str)
 
+    # ✅ FIX: Use stratify only when there are >= 2 classes
+    stratify_y = y if pd.Series(y).nunique() >= 2 else None
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=random_state, stratify=y
+        X, y, test_size=test_size, random_state=random_state, stratify=stratify_y
     )
 
     num_cols = X_train.select_dtypes(include=[np.number, "bool", "boolean"]).columns.tolist()
@@ -673,6 +675,7 @@ with tabs[6]:
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("unitprice_band not available — it appears when `sales` and `quantity` exist.")
+
 
 
 

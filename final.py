@@ -404,7 +404,7 @@ with tabs[2]:
         fig = px.box(df, y=col_x, title=f"Box: {col_x}")
         st.plotly_chart(fig, use_container_width=True)
     else:
-        col_y = st.selectbox("Y", options=df.columns, index=list(df.columns).index("profit") if "profit" in df.columns else 1)
+        col_y = st.selectbox("Y", options=df.columns, index=(list(df.columns).index("profit") if "profit" in df.columns else (1 if len(df.columns)>1 else 0)))
         color = st.selectbox("Color (optional)", options=[None] + df.columns.tolist())
         fig = px.scatter(df, x=col_x, y=col_y, color=color, title=f"Scatter: {col_x} vs {col_y}")
         st.plotly_chart(fig, use_container_width=True)
@@ -675,6 +675,7 @@ with tabs[6]:
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("unitprice_band not available — it appears when `sales` and `quantity` exist.")
+
 
 
 

@@ -2,3 +2,4 @@ Model,Precision,Recall,F1
 LogReg,1.0,1.0,1.0
 RandomForest,1.0,1.0,1.0
 GradBoost,1.0,1.0,1.0
+XGBoost,1.0,1.0,1.0

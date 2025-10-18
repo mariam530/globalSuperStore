@@ -32,11 +32,9 @@ try:
 except Exception:
     HAS_SM = False
 
-# Show full error details in Streamlit (useful while debugging)
-st.set_option("client.showErrorDetails", True)
-
 # ---------------------- App Config ----------------------
-st.set_page_config(page_title="Profit Analysis & Modeling", layout="wide")
+st.set_page_config(page_title="Profit Analysis & Modeling", layout="wide")  # MUST be first Streamlit call
+st.set_option("client.showErrorDetails", True)  # now safe after set_page_config
 st.title("📊 Profit Analysis & Modeling")
 
 # ---------------------- Sidebar ----------------------
@@ -209,6 +207,7 @@ if "profit" not in df.columns:
         st.error("Column 'profit' not found. Please ensure your dataset has a 'profit' column.")
         st.stop()
 
+# Optional downsample
 if downsample and len(df) > 20_000:
     df = df.sample(20_000, random_state=random_state).reset_index(drop=True)
     st.warning("Dataset downsampled to 20,000 rows for speed.")
@@ -674,6 +673,7 @@ with tabs[6]:
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("unitprice_band not available — it appears when `sales` and `quantity` exist.")
+
 
 
 

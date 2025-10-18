@@ -1,7 +1,6 @@
-# app.py
+# final.py
 # ============================================================
-# Streamlit: Full Analysis + Profit Modeling (Classification & Regression)
-# + Manual Prediction (single row, no file upload)
+# Streamlit: Profit Analysis & Modeling + Manual Prediction
 # ============================================================
 import io
 import numpy as np
@@ -40,7 +39,6 @@ with st.sidebar:
 
 # ---------------------- Helpers ----------------------
 def _ohe_sparse():
-    """OneHotEncoder compatible across sklearn versions."""
     try:
         return OneHotEncoder(handle_unknown="ignore", sparse_output=True, dtype=np.float32)
     except TypeError:
@@ -70,7 +68,6 @@ def _auto_parse_dates(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def add_features(X: pd.DataFrame) -> pd.DataFrame:
-    """Domain features used across the app."""
     X = X.copy()
     # Unit price & gross margin
     if {"sales", "quantity"}.issubset(X.columns):
@@ -121,7 +118,6 @@ def add_features(X: pd.DataFrame) -> pd.DataFrame:
     return X
 
 def _build_quick_clf_pipeline(X_df, y, random_state=42):
-    """Quick fallback pipeline if classification tab wasn't visited yet."""
     X_local = X_df.copy()
     for c in X_local.columns:
         if pd.api.types.is_datetime64_any_dtype(X_local[c]):
@@ -135,12 +131,11 @@ def _build_quick_clf_pipeline(X_df, y, random_state=42):
         ],
         remainder="drop", sparse_threshold=1.0
     )
-    clf = Pipeline([("prep", preprocess), ("clf", LogisticRegression(max_iter=1000))])
+    clf = Pipeline([("prep", preprocess), ("clf", RandomForestClassifier(n_estimators=200, random_state=random_state, n_jobs=-1))])
     clf.fit(X_local, y)
     return clf, num_cols, cat_cols
 
 def _build_quick_reg_pipeline(X_df, y, random_state=42):
-    """Quick fallback pipeline if regression tab wasn't visited yet."""
     X_local = X_df.copy()
     for c in X_local.columns:
         if pd.api.types.is_datetime64_any_dtype(X_local[c]):
@@ -158,7 +153,7 @@ def _build_quick_reg_pipeline(X_df, y, random_state=42):
     reg.fit(X_local, y)
     return reg, num_cols, cat_cols
 
-# ---------------------- Load & Clean (direct file) ----------------------
+# ---------------------- Load & Clean ----------------------
 df = pd.read_csv("Global_Superstore2.csv", encoding="latin1")
 df = _normalize_columns(df)
 df = _auto_parse_dates(df)
@@ -167,7 +162,6 @@ st.subheader("📄 Data Preview")
 st.write(df.head())
 st.write(f"Rows: {len(df):,} | Columns: {len(df.columns)}")
 
-# Ensure profit column
 if "profit" not in df.columns:
     cand = [c for c in df.columns if c.lower() == "profit"]
     if cand:
@@ -176,12 +170,10 @@ if "profit" not in df.columns:
         st.error("Column 'profit' not found. Please ensure your dataset has a 'profit' column.")
         st.stop()
 
-# Optional downsample
 if downsample and len(df) > 20_000:
     df = df.sample(20_000, random_state=random_state).reset_index(drop=True)
     st.warning("Dataset downsampled to 20,000 rows for speed.")
 
-# Feature engineering
 df = add_features(df)
 
 # ============================================================
@@ -190,7 +182,7 @@ df = add_features(df)
 tabs = st.tabs([
     "Overview", "Analysis", "Visualizations",
     "Model: Classification", "Model: Regression",
-    "Manual Prediction",  # NEW
+    "Manual Prediction",
     "Export"
 ])
 
@@ -207,81 +199,184 @@ with tabs[0]:
         miss = df.isna().sum().sort_values(ascending=False)
         st.write(miss[miss > 0].to_frame("missing_count") if (miss > 0).any() else "No missing values detected.")
 
-# ---------------------- Analysis Tab ----------------------
+# ---------------------- Analysis Tab (Uni / Bi / Multi) ----------------------
 with tabs[1]:
-    st.subheader("Common Analysis Questions")
+    st.subheader("Analysis")
 
-    st.markdown("**1) Top/Bottom by profit**")
-    top_n = st.slider("N (top/bottom)", 3, 50, 10, 1, key="n_top")
-    groupable_cols = [c for c in df.columns if df[c].dtype == object or df[c].dtype.name == "category"]
-    by_col = st.selectbox("Group by", options=groupable_cols + ["(no group)"])
-    if by_col != "(no group)":
-        g = df.groupby(by_col, dropna=False)["profit"].sum().sort_values(ascending=False)
-        c1, c2 = st.columns(2)
-        with c1:
-            st.write("**Top**")
-            st.write(g.head(top_n).to_frame("sum_profit"))
-        with c2:
-            st.write("**Bottom**")
-            st.write(g.tail(top_n).to_frame("sum_profit"))
-    else:
-        st.info("Choose a categorical column to aggregate by.")
+    sub_tabs = st.tabs(["Univariate", "Bivariate", "Multivariate"])
 
-    st.markdown("---")
-    st.markdown("**2) Average metrics by segment/category**")
-    group_cols = st.multiselect("Select grouping columns", options=df.columns.tolist(),
-                                default=[c for c in ["segment", "category"] if c in df.columns])
-    metrics = st.multiselect(
-        "Select metrics",
-        options=[c for c in ["profit", "sales", "quantity", "shipping_cost", "discount_pct", "unit_price"] if c in df.columns],
-        default=[c for c in ["profit", "sales"] if c in df.columns]
-    )
-    if group_cols and metrics:
-        agg_df = df.groupby(group_cols, dropna=False)[metrics].mean().reset_index()
-        st.write(agg_df)
+    # =============== Univariate ===============
+    with sub_tabs[0]:
+        st.markdown("Explore single-variable distributions and summaries.")
+        options_uni = df.columns.tolist()
+        default_uni_idx = options_uni.index("profit") if "profit" in options_uni else 0
+        col_uni = st.selectbox("Select a column", options=options_uni, index=default_uni_idx, key="uni_col")
 
-    st.markdown("---")
-    st.markdown("**3) Correlation (numeric)**")
-    numdf = df.select_dtypes(include=[np.number, "boolean", "bool"])
-    if not numdf.empty:
-        corr = numdf.corr(numeric_only=True)
-        fig = px.imshow(corr, title="Correlation Heatmap", aspect="auto")
+        miss_cnt = int(df[col_uni].isna().sum())
+        st.caption(f"Missing values in **{col_uni}**: {miss_cnt:,}")
+
+        if pd.api.types.is_numeric_dtype(df[col_uni]):
+            st.write("**Summary (numeric)**")
+            st.write(df[col_uni].describe().to_frame().T)
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.write("**Histogram**")
+                fig = px.histogram(df, x=col_uni, nbins=50, title=f"Histogram: {col_uni}")
+                st.plotly_chart(fig, use_container_width=True)
+            with c2:
+                st.write("**Box Plot**")
+                fig = px.box(df, y=col_uni, points="suspectedoutliers", title=f"Box: {col_uni}")
+                st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.write("**Category counts**")
+            vc = (df[col_uni].value_counts(dropna=False)
+                  .rename_axis(col_uni).reset_index(name="count"))
+            vc = vc[vc[col_uni].notna()]
+            fig = px.bar(vc.head(50), x=col_uni, y="count", title=f"Top categories: {col_uni}")
+            st.plotly_chart(fig, use_container_width=True)
+
+    # =============== Bivariate ===============
+    with sub_tabs[1]:
+        st.markdown("Explore relationships between two variables.")
+        cols_all = df.columns.tolist()
+
+        if "sales" in cols_all:
+            x_default = "sales"
+        elif "quantity" in cols_all:
+            x_default = "quantity"
+        else:
+            x_default = next((c for c in cols_all if c != "profit"), cols_all[0])
+        x_index = cols_all.index(x_default)
+        col_x = st.selectbox("X", options=cols_all, index=x_index, key="bi_x")
+
+        y_options = [c for c in cols_all if c != col_x]
+        y_index = y_options.index("profit") if "profit" in y_options else 0
+        col_y = st.selectbox("Y (target/metric)", options=y_options, index=y_index, key="bi_y")
+
+        color_opt = st.selectbox("Color (optional)", options=[None] + cols_all, key="bi_color")
+
+        if pd.api.types.is_numeric_dtype(df[col_x]) and pd.api.types.is_numeric_dtype(df[col_y]):
+            fig = px.scatter(df, x=col_x, y=col_y, color=color_opt,
+                             trendline="ols" if color_opt is None else None,
+                             title=f"Scatter: {col_x} vs {col_y}")
+            st.plotly_chart(fig, use_container_width=True)
+        elif (not pd.api.types.is_numeric_dtype(df[col_x])) and pd.api.types.is_numeric_dtype(df[col_y]):
+            agg_func = st.selectbox("Aggregation", ["sum", "mean", "median", "count"], index=1, key="bi_agg")
+            g = getattr(df.groupby(col_x, dropna=False)[col_y], agg_func)().reset_index().sort_values(col_y, ascending=False)
+            st.write(g.head(50))
+            fig = px.bar(g.head(50), x=col_x, y=col_y,
+                         color=color_opt if color_opt in g.columns else None,
+                         title=f"{agg_func.upper()}({col_y}) by {col_x}")
+            st.plotly_chart(fig, use_container_width=True)
+        elif pd.api.types.is_numeric_dtype(df[col_x]) and (not pd.api.types.is_numeric_dtype(df[col_y])):
+            agg_func = st.selectbox("Aggregation", ["sum", "mean", "median", "count"], index=1, key="bi_agg_swap")
+            g = getattr(df.groupby(col_y, dropna=False)[col_x], agg_func)().reset_index().sort_values(col_x, ascending=False)
+            st.write(g.head(50))
+            fig = px.bar(g.head(50), x=col_y, y=col_x,
+                         color=color_opt if color_opt in g.columns else None,
+                         title=f"{agg_func.upper()}({col_x}) by {col_y}")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Both selected columns are categorical — showing count table.")
+            ct = df.groupby([col_x, col_y], dropna=False).size().reset_index(name="count")
+            st.write(ct.head(100))
+            fig = px.density_heatmap(ct, x=col_x, y=col_y, z="count", title=f"Counts: {col_x} × {col_y}")
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("---")
+        st.markdown("**Time series (if order_yearmonth available)**")
+        if "order_yearmonth" in df.columns:
+            ts_opts = [c for c in ["profit", "sales", "quantity"] if c in df.columns]
+            ts_index = ts_opts.index("profit") if "profit" in ts_opts else 0
+            ts_metric = st.selectbox("Metric", options=ts_opts, index=ts_index, key="bi_ts_metric")
+            ts = df.groupby("order_yearmonth")[ts_metric].sum().reset_index()
+            fig = px.line(ts, x="order_yearmonth", y=ts_metric, title=f"{ts_metric} over time (monthly)")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.caption("order_date/order_yearmonth not available.")
+
+    # =============== Multivariate ===============
+    with sub_tabs[2]:
+        st.markdown("Explore multi-variable patterns.")
+
+        st.markdown("**Correlation heatmap (numeric)**")
+        numdf = df.select_dtypes(include=[np.number, "boolean", "bool"])
+        if not numdf.empty:
+            corr = numdf.corr(numeric_only=True)
+            fig = px.imshow(corr, title="Correlation Heatmap", aspect="auto")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No numeric columns to show correlations.")
+
+        st.markdown("---")
+
+        if not numdf.empty:
+            default_sm = [c for c in ["profit", "sales", "quantity", "unit_price"] if c in numdf.columns][:4]
+            choose_cols = st.multiselect("Scatter Matrix: choose up to 6 numeric columns",
+                                         options=numdf.columns.tolist(),
+                                         default=default_sm,
+                                         key="multi_scatter_cols")
+            if choose_cols:
+                fig = px.scatter_matrix(df, dimensions=choose_cols, title="Scatter Matrix")
+                st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("---")
+
+        st.markdown("**Pivot heatmap (category × category → metric)**")
+        cat_cols = df.select_dtypes(exclude=[np.number, "boolean", "bool"]).columns.tolist()
+        if len(cat_cols) >= 2:
+            r_cat = st.selectbox("Rows (categorical)", options=cat_cols, key="multi_r")
+            c_cat = st.selectbox("Columns (categorical)", options=[c for c in cat_cols if c != r_cat], key="multi_c")
+            metric_opts = [c for c in ["profit","sales","quantity","unit_price","shipping_cost","discount_pct"] if c in df.columns]
+            metric_index = metric_opts.index("profit") if "profit" in metric_opts else 0
+            metric = st.selectbox("Metric (numeric)", options=metric_opts, index=metric_index, key="multi_metric")
+            agg_func = st.selectbox("Aggregation", ["sum", "mean", "median", "count"], index=0, key="multi_agg")
+
+            tmp = df[[r_cat, c_cat, metric]].copy()
+            if agg_func == "count":
+                pvt = tmp.pivot_table(index=r_cat, columns=c_cat, values=metric, aggfunc="count", fill_value=0)
+            else:
+                pvt = tmp.pivot_table(index=r_cat, columns=c_cat, values=metric, aggfunc=agg_func, fill_value=0)
+            fig = px.imshow(pvt, aspect="auto", title=f"{agg_func.upper()}({metric}) by {r_cat} × {c_cat}")
+            st.plotly_chart(fig, use_container_width=True)
+            st.write(pvt)
+        else:
+            st.info("Need at least two categorical columns for a pivot heatmap.")
+
+# ---------------------- Visualizations Tab ----------------------
+with tabs[2]:
+    st.subheader("Quick Visualizations")
+    col_x = st.selectbox("X", options=df.columns, index=list(df.columns).index("unitprice_band") if "unitprice_band" in df.columns else 0)
+    kind = st.selectbox("Chart type", ["Bar (counts)", "Histogram", "Box", "Scatter"])
+    if kind == "Bar (counts)":
+        vc = (df[col_x].value_counts(dropna=False)
+              .rename_axis(col_x).reset_index(name="count"))
+        vc = vc[vc[col_x].notna()]
+        fig = px.bar(vc, x=col_x, y="count", title=f"Counts by {col_x}")
+        st.plotly_chart(fig, use_container_width=True)
+    elif kind == "Histogram":
+        fig = px.histogram(df, x=col_x, title=f"Histogram: {col_x}")
+        st.plotly_chart(fig, use_container_width=True)
+    elif kind == "Box":
+        fig = px.box(df, y=col_x, title=f"Box: {col_x}")
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("No numeric columns to show correlations.")
-
-    st.markdown("---")
-    st.markdown("**4) Time series (if order_date available)**")
-    if "order_yearmonth" in df.columns:
-        ts_metric = st.selectbox("Metric", options=[c for c in ["profit", "sales", "quantity"] if c in df.columns], index=0)
-        ts = df.groupby("order_yearmonth")[ts_metric].sum().reset_index()
-        fig = px.line(ts, x="order_yearmonth", y=ts_metric, title=f"{ts_metric} over time (monthly)")
+        col_y = st.selectbox("Y", options=df.columns, index=list(df.columns).index("profit") if "profit" in df.columns else 1)
+        color = st.selectbox("Color (optional)", options=[None] + df.columns.tolist())
+        fig = px.scatter(df, x=col_x, y=col_y, color=color, title=f"Scatter: {col_x} vs {col_y}")
         st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("order_date/order_yearmonth not available.")
-
-    st.markdown("---")
-    st.markdown("**5) Shipping delay vs profit (if available)**")
-    if {"ship_delay_days", "profit"}.issubset(df.columns):
-        color_col = "segment" if "segment" in df.columns else None
-        fig = px.scatter(df, x="ship_delay_days", y="profit", color=color_col, title="Shipping delay vs Profit")
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("ship_delay_days not available to plot.")
 
 # ---------------------- Classification Tab ----------------------
 with tabs[3]:
     st.header("🔎 Classification: profit > 0")
-    # Target
     y = (pd.to_numeric(df["profit"], errors="coerce") > 0).astype(int)
     X = df.copy()
 
-    # Leakage guard
     LEAK_LIKE = {"profit", "is_profitable", "profit_bucket", "gross_margin_pct", "profitability_category"}
     leak_cols = [c for c in X.columns if (c.lower() in LEAK_LIKE) or ("profit" in c.lower())]
     X = X.drop(columns=leak_cols, errors="ignore")
 
-    # Datetime → monthly bins (strings)
     for c in X.columns:
         if pd.api.types.is_datetime64_any_dtype(X[c]):
             X[c] = pd.to_datetime(X[c], errors="coerce").dt.to_period("M").astype(str)
@@ -302,11 +397,15 @@ with tabs[3]:
         sparse_threshold=1.0
     )
 
-    model_name = st.selectbox("Model", ["LogisticRegression", "RandomForest", "GradientBoosting"])
-    if model_name == "LogisticRegression":
-        model = LogisticRegression(max_iter=1000)
-    elif model_name == "RandomForest":
+    # RandomForest first (default)
+    model_name = st.selectbox(
+        "Model",
+        ["RandomForest", "LogisticRegression", "GradientBoosting"]
+    )
+    if model_name == "RandomForest":
         model = RandomForestClassifier(n_estimators=200, random_state=random_state, n_jobs=-1)
+    elif model_name == "LogisticRegression":
+        model = LogisticRegression(max_iter=1000)
     else:
         model = GradientBoostingClassifier(random_state=random_state)
 
@@ -314,7 +413,6 @@ with tabs[3]:
     with st.spinner("Training classifier..."):
         clf_pipe.fit(X_train, y_train)
 
-    # Default threshold=0.5
     y_pred = clf_pipe.predict(X_test)
     prec = precision_score(y_test, y_pred, zero_division=0)
     rec  = recall_score(y_test, y_pred, zero_division=0)
@@ -331,7 +429,6 @@ with tabs[3]:
                           index=pd.Index(["True 0","True 1"], name="Actual"),
                           columns=pd.Index(["Pred 0","Pred 1"], name="Predicted")))
 
-    # Threshold tuning (if available)
     thr = 0.5
     if hasattr(clf_pipe, "predict_proba"):
         st.subheader("🎚️ Threshold Tuning (maximize F1)")
@@ -354,7 +451,6 @@ with tabs[4]:
     y = pd.to_numeric(df["profit"], errors="coerce")
     X = df.drop(columns=["profit"], errors="ignore")
 
-    # Datetime → monthly bins
     for c in X.columns:
         if pd.api.types.is_datetime64_any_dtype(X[c]):
             X[c] = pd.to_datetime(X[c], errors="coerce").dt.to_period("M").astype(str)
@@ -375,11 +471,15 @@ with tabs[4]:
         sparse_threshold=1.0
     )
 
-    model_name = st.selectbox("Model", ["LinearRegression", "RandomForestRegressor", "GradientBoostingRegressor"])
-    if model_name == "LinearRegression":
-        model = LinearRegression()
-    elif model_name == "RandomForestRegressor":
+    # RandomForestRegressor first (default)
+    model_name = st.selectbox(
+        "Model",
+        ["RandomForestRegressor", "LinearRegression", "GradientBoostingRegressor"]
+    )
+    if model_name == "RandomForestRegressor":
         model = RandomForestRegressor(n_estimators=300, random_state=random_state, n_jobs=-1)
+    elif model_name == "LinearRegression":
+        model = LinearRegression()
     else:
         model = GradientBoostingRegressor(random_state=random_state)
 
@@ -403,13 +503,11 @@ with tabs[4]:
                        out_df.to_csv(index=False).encode(),
                        file_name="profit_regression_preds.csv")
 
-# ---------------------- Manual Prediction Tab (NEW) ----------------------
+# ---------------------- Manual Prediction Tab ----------------------
 with tabs[5]:
     st.header("📝 Manual Prediction (single row)")
 
     df_ref = df.copy()
-
-    # Requested columns (normalized)
     requested_cols = [
         "segment", "city", "state", "country", "postal_code", "market", "region",
         "product_id", "category", "sub_category", "product_name",
@@ -417,12 +515,10 @@ with tabs[5]:
     ]
     available = [c for c in requested_cols if c in df_ref.columns]
 
-    # Build suggestions for categoricals (top-50)
     cat_suggestions = {}
     for c in df_ref.select_dtypes(include=["object", "category"]).columns:
         cat_suggestions[c] = list(df_ref[c].dropna().astype(str).value_counts().head(50).index)
 
-    # Numeric defaults (median)
     num_defaults = {}
     for c in df_ref.select_dtypes(include=[np.number, "bool", "boolean"]).columns:
         try:
@@ -434,7 +530,6 @@ with tabs[5]:
     categorical_fields = [c for c in available if c not in numeric_fields]
 
     c1, c2 = st.columns(2)
-
     with c1:
         st.subheader("🔢 Numeric")
         num_inputs = {}
@@ -458,17 +553,14 @@ with tabs[5]:
             else:
                 cat_inputs[col] = st.text_input(col, value="")
 
-    # Construct a single row
     row = {}
     for k, v in num_inputs.items(): row[k] = v
     for k, v in cat_inputs.items(): row[k] = v if (v is not None and v != "") else None
     one = pd.DataFrame([row])
 
-    # Make sure all dataset columns exist for feature computation
     for m in set(df_ref.columns) - set(one.columns):
         one[m] = np.nan
 
-    # Normalize + parse dates + features
     one = _normalize_columns(one)
     one = _auto_parse_dates(one)
     one = add_features(one)
@@ -479,7 +571,6 @@ with tabs[5]:
     do_class = st.checkbox("🔎 Classification (profit > 0)", value=True)
     do_reg   = st.checkbox("📈 Regression (predict profit value)", value=True)
 
-    # ===== Classification =====
     if do_class:
         st.markdown("### 🔎 Classification Result")
         X_clf = one.copy()
@@ -510,7 +601,6 @@ with tabs[5]:
             pred = int(pipe.predict(X_align)[0])
             st.write({"pred_class": pred})
 
-    # ===== Regression =====
     if do_reg:
         st.markdown("### 📈 Regression Result")
         X_reg = one.drop(columns=["profit"], errors="ignore").copy()
@@ -532,8 +622,6 @@ with tabs[5]:
         y_pred_one = float(rpipe.predict(X_align_r)[0])
         st.write({"y_pred_profit": y_pred_one})
 
-    st.info("✳️ Manual tab uses the same preprocessing and features. If you open the model tabs first, it will reuse those trained pipelines.")
-
 # ---------------------- Export Tab ----------------------
 with tabs[6]:
     st.header("📤 Export & Save")
@@ -553,6 +641,7 @@ with tabs[6]:
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("unitprice_band not available — it appears when `sales` and `quantity` exist.")
+
 
 
 

@@ -24,6 +24,13 @@ from sklearn.ensemble import (
     RandomForestRegressor, GradientBoostingRegressor
 )
 
+# ---------- Optional: enable Plotly trendline if statsmodels is installed ----------
+try:
+    import statsmodels.api as sm  # noqa: F401
+    HAS_SM = True
+except Exception:
+    HAS_SM = False
+
 # ---------------------- App Config ----------------------
 st.set_page_config(page_title="Profit Analysis & Modeling", layout="wide")
 st.title("📊 Profit Analysis & Modeling")
@@ -257,10 +264,14 @@ with tabs[1]:
         color_opt = st.selectbox("Color (optional)", options=[None] + cols_all, key="bi_color")
 
         if pd.api.types.is_numeric_dtype(df[col_x]) and pd.api.types.is_numeric_dtype(df[col_y]):
-            fig = px.scatter(df, x=col_x, y=col_y, color=color_opt,
-                             trendline="ols" if color_opt is None else None,
-                             title=f"Scatter: {col_x} vs {col_y}")
+            fig = px.scatter(
+                df, x=col_x, y=col_y, color=color_opt,
+                trendline=("ols" if (color_opt is None and HAS_SM) else None),
+                title=f"Scatter: {col_x} vs {col_y}"
+            )
             st.plotly_chart(fig, use_container_width=True)
+            if color_opt is None and not HAS_SM:
+                st.caption("ℹ️ Trendline disabled: install `statsmodels` to enable OLS line.")
         elif (not pd.api.types.is_numeric_dtype(df[col_x])) and pd.api.types.is_numeric_dtype(df[col_y]):
             agg_func = st.selectbox("Aggregation", ["sum", "mean", "median", "count"], index=1, key="bi_agg")
             g = getattr(df.groupby(col_x, dropna=False)[col_y], agg_func)().reset_index().sort_values(col_y, ascending=False)
